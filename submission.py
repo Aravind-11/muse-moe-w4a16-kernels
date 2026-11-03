@@ -1,17 +1,17 @@
 # okc: problem=muse_moe_w4a16
 # ==================================================================================================
-# v8 — in-CTA split-K (more warps per weight unit)
-# Judged score: 1.2211× (check `3ad16a1427c34bd4`)   (previous best: 1.0118× (v7))
-# Built on: v7
+# v9 — GEMM2 does GEMM1's per-tile work; late B loads for big tiles
+# Judged score: 1.2583× scored (`7a5b622a61874984`; check 1.2691×)   (previous best: 1.2211× (v8))
+# Built on: v8
 #
 # What this version does and why it is faster: see README.md in this folder.
 # Every line that produced this version's speedup is marked with a comment starting
-# 'SPEEDUP (v8)' (search for it). Those comments are the only change from the judged file;
+# 'SPEEDUP (v9)' (search for it). Those comments are the only change from the judged file;
 # no code was altered.
 # ==================================================================================================
 """NVFP4 routed experts on H200.
 
-S4: both expert GEMMs run on one swap-AB mma.m16n8k16 BF16 kernel (weights on M, tokens on N).
+S5: both expert GEMMs run on one swap-AB mma.m16n8k16 BF16 kernel (weights on M, tokens on N).
 GEMM1 fuses silu(gate)*up into its epilogue (a warp owns 16 gate rows and the matching 16 up rows)
 and writes the GEMM2 input directly; GEMM2 writes y for the Triton post-norm.
 
@@ -275,6 +275,10 @@ __device__ __forceinline__ void ldsm4(uint32_t r[4], const void* p) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
 }
+__device__ __forceinline__ void ldsm2(uint32_t r[2], const void* p) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+               : "=r"(r[0]), "=r"(r[1]) : "r"(smem_u32(p)));
+}
 __device__ __forceinline__ uint32_t hmul2(uint32_t a, uint32_t b) {
   uint32_t d;
   asm("mul.rn.bf16x2 %0, %1, %2;\n" : "=r"(d) : "r"(a), "r"(b));
@@ -304,15 +308,20 @@ __device__ __forceinline__ uint32_t scale_dup(uint32_t u, int s) {
   return x * 16u + 0x58805880u;
 }
 
-// MATS == 2: GEMM1, gate+up rows per 16-row unit, epilogue silu(gate)*up, activation row = token.
-// MATS == 1: GEMM2, activation row = slot (cache2), epilogue plain bf16.
-template <int MATS, int NW, int G, int S, int KS>
+// SPEEDUP (v9): GEMM2 now has 2 matrices per unit (rows r and r+2048), the same per-tile work as GEMM1.
+// KIND == 1: GEMM1. A 16-row unit is 16 gate rows + the matching 16 up rows; epilogue silu(gate)*up;
+//            activation row = token; 256 units.
+// KIND == 2: GEMM2. A unit is 16 rows of W2 + the same 16 rows offset by 2048 (same per-tile work as
+//            GEMM1); epilogue plain bf16; activation row = slot (cache2); 128 units.
+template <int KIND, int NW, int G, int S, int KS>
 __global__ void __launch_bounds__(NW * KS * 32)
 moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__ W,
                 const float* __restrict__ GS, const int* __restrict__ sorted_ids,
                 const int* __restrict__ block_experts, const int* __restrict__ n_padded,
                 __nv_bfloat16* __restrict__ OUT, int numel, int snumel, int mode) {
   constexpr int T = G * 8;
+  constexpr int MATS = 2;
+  constexpr int NTU = KIND == 1 ? 256 : 128;
   constexpr int NTH = NW * KS * 32;
   constexpr int PIECE = MATS * 576;
   constexpr int SUB_W = NW * PIECE;          // one K tile of this CTA's NW 16-row units
@@ -336,8 +345,6 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
 
   const int tid = (int)threadIdx.x;
   const int warp = tid >> 5;
-  // SPEEDUP (v8): warps are split into NW weight units x KS K-slices; each K-slice warp handles
-  // every KS-th K tile of the same 16 rows, so KS independent chains run per unit.
   const int unit = warp % NW;   // which 16-row unit
   const int ks = warp / NW;     // which K tile of each stage
   const int lane = tid & 31;
@@ -356,7 +363,7 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
     const int slot = ii < snumel ? sorted_ids[ii] : numel;
     const bool valid = slot < numel;
     slots[tid] = valid ? slot : -1;
-    tokoff[tid] = valid ? (MATS == 2 ? (slot >> 3) : slot) * KDIM : -1;
+    tokoff[tid] = valid ? (KIND == 1 ? (slot >> 3) : slot) * KDIM : -1;
     if (valid) atomicMax(&nact_s, tid + 1);
   }
   __syncthreads();
@@ -364,7 +371,7 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
   if (nact <= 0) return;
 
   const int nchunk = (int)blockIdx.x;
-  const uint8_t* wsrc = W + ((size_t)expert * KT * NT16 + (size_t)nchunk * NW) * PIECE;
+  const uint8_t* wsrc = W + ((size_t)expert * KT * NTU + (size_t)nchunk * NW) * PIECE;
 
   auto issue = [&](int kto, int st) {
     char* sbase = stages + st * STAGE;
@@ -372,7 +379,7 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
       mbar_expect_tx(&bars[st], (unsigned)(KS * SUB_W));
 #pragma unroll
       for (int k2 = 0; k2 < KS; ++k2) {
-        tma_1d(sbase + k2 * SUB, wsrc + (size_t)(kto * KS + k2) * NT16 * PIECE, (unsigned)SUB_W, &bars[st]);
+        tma_1d(sbase + k2 * SUB, wsrc + (size_t)(kto * KS + k2) * NTU * PIECE, (unsigned)SUB_W, &bars[st]);
       }
     }
     for (int i = tid; i < KS * T * 8; i += NTH) {
@@ -431,6 +438,32 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
       }
     }
     const __nv_bfloat16* ab = reinterpret_cast<const __nv_bfloat16*>(sbase + SUB_W);
+    // SPEEDUP (v9): big tiles load each atom's B fragments right before use: 2 live registers per group.
+    if constexpr (G >= 4) {
+      // Large token tiles: load each atom's B fragments just before use (2 live regs per group).
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        uint32_t ag[MATS][4];
+#pragma unroll
+        for (int m = 0; m < MATS; ++m) {
+          uint32_t r[4];
+          deq(wv[m][s], r);
+          ag[m][0] = hmul2(r[0], sc[m][0][s]);
+          ag[m][1] = hmul2(r[1], sc[m][1][s]);
+          ag[m][2] = hmul2(r[2], sc[m][0][s]);
+          ag[m][3] = hmul2(r[3], sc[m][1][s]);
+        }
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+          if (g * 8 < nact) {
+            uint32_t b[2];
+            ldsm2(b, ab + (g * 8 + (lane & 7)) * ACT_LD + s * 16 + ((lane >> 3) & 1) * 8);
+#pragma unroll
+            for (int m = 0; m < MATS; ++m) mma16816(acc[m][g], ag[m][0], ag[m][1], ag[m][2], ag[m][3], b[0], b[1]);
+          }
+        }
+      }
+    } else {
 #pragma unroll
     for (int sp = 0; sp < 4; sp += 2) {
       uint32_t bfr[G][4];
@@ -456,10 +489,10 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
         }
       }
     }
+    }
   }
 
   if (mode == 1) return;
-  // SPEEDUP (v8): combine the KS partial accumulators through shared memory; warps with ks > 0 exit.
   if constexpr (KS > 1) {
     // Sum the KS partial accumulators of each 16-row unit through shared memory (lane-fastest).
     constexpr int NACC = MATS * G * 4;
@@ -495,44 +528,44 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
       const int idx = g * 8 + tig * 2 + c;
       const int slot = slots[idx];
       if (slot >= 0) {
-        float v0, v1;
-        if constexpr (MATS == 2) {
-          const float x0 = acc[0][g][c] * gf;
-          const float y0 = acc[MATS - 1][g][c] * gf;
-          const float x1 = acc[0][g][2 + c] * gf;
-          const float y1 = acc[MATS - 1][g][2 + c] * gf;
-          v0 = x0 * __frcp_rn(1.0f + __expf(-x0)) * y0;
-          v1 = x1 * __frcp_rn(1.0f + __expf(-x1)) * y1;
-        } else {
-          v0 = acc[0][g][c] * gf;
-          v1 = acc[0][g][2 + c] * gf;
-        }
         __nv_bfloat16* o = OUT + (size_t)slot * NOUT;
-        o[row0] = __float2bfloat16(v0);
-        o[row0 + 8] = __float2bfloat16(v1);
+        if constexpr (KIND == 1) {
+          const float x0 = acc[0][g][c] * gf;
+          const float y0 = acc[1][g][c] * gf;
+          const float x1 = acc[0][g][2 + c] * gf;
+          const float y1 = acc[1][g][2 + c] * gf;
+          o[row0] = __float2bfloat16(x0 * __frcp_rn(1.0f + __expf(-x0)) * y0);
+          o[row0 + 8] = __float2bfloat16(x1 * __frcp_rn(1.0f + __expf(-x1)) * y1);
+        } else {
+          o[row0] = __float2bfloat16(acc[0][g][c] * gf);
+          o[row0 + 8] = __float2bfloat16(acc[0][g][2 + c] * gf);
+          // SPEEDUP (v9): GEMM2's second matrix writes the output rows offset by 2048.
+          o[row0 + 2048] = __float2bfloat16(acc[1][g][c] * gf);
+          o[row0 + 2056] = __float2bfloat16(acc[1][g][2 + c] * gf);
+        }
       }
     }
   }
 }
 
-template <int MATS, int NW, int G, int S, int KS>
+template <int KIND, int NW, int G, int S, int KS>
 struct Cfg {
   static constexpr size_t smem =
-      (size_t)S * KS * (NW * MATS * 576 + G * 8 * ACT_LD * 2) + (size_t)G * 8 * 8 + 128;
+      (size_t)S * KS * (NW * 2 * 576 + G * 8 * ACT_LD * 2) + (size_t)G * 8 * 8 + 128;
 };
 
-template <int MATS, int NW, int G, int S, int KS>
+template <int KIND, int NW, int G, int S, int KS>
 int run(const void* x, const void* w, const void* gs, const void* sorted_ids, const void* bexp,
         const void* npad, void* out, int numel, int snumel, int nblocks, int mode, cudaStream_t stream) {
   static bool init = false;
   if (!init) {
-    cudaFuncSetAttribute(moe_gemm_kernel<MATS, NW, G, S, KS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         (int)Cfg<MATS, NW, G, S, KS>::smem);
+    cudaFuncSetAttribute(moe_gemm_kernel<KIND, NW, G, S, KS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)Cfg<KIND, NW, G, S, KS>::smem);
     init = true;
   }
-  dim3 grid(NT16 / NW, nblocks);
+  dim3 grid((KIND == 1 ? 256 : 128) / NW, nblocks);
   dim3 block(NW * KS * 32);
-  moe_gemm_kernel<MATS, NW, G, S, KS><<<grid, block, Cfg<MATS, NW, G, S, KS>::smem, stream>>>(
+  moe_gemm_kernel<KIND, NW, G, S, KS><<<grid, block, Cfg<KIND, NW, G, S, KS>::smem, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const uint8_t*>(w),
       reinterpret_cast<const float*>(gs), reinterpret_cast<const int*>(sorted_ids),
       reinterpret_cast<const int*>(bexp), reinterpret_cast<const int*>(npad),
@@ -540,19 +573,19 @@ int run(const void* x, const void* w, const void* gs, const void* sorted_ids, co
   return (int)cudaGetLastError();
 }
 
-template <int MATS, int NW, int G, int S, int KS>
+template <int KIND, int NW, int G, int S, int KS>
 void attrs_one(int* o) {
   cudaFuncAttributes a;
-  cudaFuncGetAttributes(&a, moe_gemm_kernel<MATS, NW, G, S, KS>);
-  cudaFuncSetAttribute(moe_gemm_kernel<MATS, NW, G, S, KS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       (int)Cfg<MATS, NW, G, S, KS>::smem);
+  cudaFuncGetAttributes(&a, moe_gemm_kernel<KIND, NW, G, S, KS>);
+  cudaFuncSetAttribute(moe_gemm_kernel<KIND, NW, G, S, KS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       (int)Cfg<KIND, NW, G, S, KS>::smem);
   int blocks = 0;
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, moe_gemm_kernel<MATS, NW, G, S, KS>, NW * KS * 32,
-                                                Cfg<MATS, NW, G, S, KS>::smem);
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, moe_gemm_kernel<KIND, NW, G, S, KS>, NW * KS * 32,
+                                                Cfg<KIND, NW, G, S, KS>::smem);
   o[0] = a.numRegs;
   o[1] = (int)a.localSizeBytes;
   o[2] = NW * 100 + KS;
-  o[3] = (int)Cfg<MATS, NW, G, S, KS>::smem;
+  o[3] = (int)Cfg<KIND, NW, G, S, KS>::smem;
   o[4] = blocks;
   o[5] = S;
 }
@@ -647,6 +680,51 @@ post_norm_kernel(const __nv_bfloat16* __restrict__ Y, const float* __restrict__ 
   }
 }
 
+// One CTA (1024 threads): global ids -> local ids (-1 if not on this GPU), per-expert counts, block-padded
+// offsets, sorted slot list (padding = numel), per-block expert, padded total. Replaces the expert_map
+// gather plus moe_align_block_size when both GEMMs are ours.
+__global__ void __launch_bounds__(1024)
+route_kernel(const int* __restrict__ ids, int numel, int local_start, int bsm, int* __restrict__ local_ids,
+             int* __restrict__ sorted_ids, int cap, int* __restrict__ block_experts, int nblocks,
+             int* __restrict__ n_padded) {
+  __shared__ int cnt[32];
+  __shared__ int off[33];
+  __shared__ int fill[32];
+  const int tid = (int)threadIdx.x;
+  if (tid < 32) {
+    cnt[tid] = 0;
+    fill[tid] = 0;
+  }
+  __syncthreads();
+  for (int i = tid; i < numel; i += 1024) {
+    const int l = ids[i] - local_start;
+    const int loc = (l >= 0 && l < 32) ? l : -1;
+    local_ids[i] = loc;
+    if (loc >= 0) atomicAdd(&cnt[loc], 1);
+  }
+  for (int i = tid; i < cap; i += 1024) sorted_ids[i] = numel;
+  __syncthreads();
+  if (tid == 0) {
+    off[0] = 0;
+    for (int e = 0; e < 32; ++e) off[e + 1] = off[e] + ((cnt[e] + bsm - 1) / bsm) * bsm;
+    *n_padded = off[32];
+  }
+  __syncthreads();
+  for (int b = tid; b < nblocks; b += 1024) {
+    const int pos = b * bsm;
+    int e = -1;
+    for (int k = 0; k < 32; ++k) e = (pos >= off[k] && pos < off[k + 1]) ? k : e;
+    block_experts[b] = e;
+  }
+  for (int i = tid; i < numel; i += 1024) {
+    const int l = ids[i] - local_start;
+    if (l >= 0 && l < 32) {
+      const int p = atomicAdd(&fill[l], 1);
+      sorted_ids[off[l] + p] = i;
+    }
+  }
+}
+
 }  // namespace
 '''
 
@@ -658,11 +736,11 @@ G1_VARIANTS = {8: [(4, 1, 6, 1), (2, 1, 8, 1), (2, 1, 4, 4), (4, 1, 4, 2)],
                32: [(8, 4, 5, 1), (4, 4, 6, 1), (4, 4, 4, 2)],
                48: [(8, 6, 4, 1), (4, 6, 4, 2)],
                64: [(8, 8, 4, 1), (4, 8, 5, 1), (4, 8, 3, 2)]}
-G2_VARIANTS = {8: [(8, 1, 8, 1), (4, 1, 8, 1), (4, 1, 4, 4), (8, 1, 4, 2)],
-               16: [(8, 2, 8, 1), (4, 2, 8, 1), (4, 2, 4, 4), (8, 2, 4, 2)],
-               32: [(8, 4, 6, 1), (4, 4, 4, 4)],
-               48: [(8, 6, 5, 1), (4, 6, 4, 2)],
-               64: [(8, 8, 5, 1), (4, 8, 4, 2)]}
+G2_VARIANTS = {8: [(4, 1, 6, 1), (2, 1, 8, 1), (2, 1, 4, 4), (4, 1, 4, 2)],
+               16: [(4, 2, 6, 1), (2, 2, 8, 1), (2, 2, 4, 4), (4, 2, 4, 2)],
+               32: [(8, 4, 5, 1), (4, 4, 6, 1), (4, 4, 4, 2)],
+               48: [(8, 6, 4, 1), (4, 6, 4, 2)],
+               64: [(8, 8, 4, 1), (4, 8, 5, 1), (4, 8, 3, 2)]}
 _ARGS_DECL = ("const void* x, const void* w, const void* gs, const void* sorted_ids, const void* bexp, "
               "const void* npad, void* out, int numel, int snumel, int nblocks, int mode, cudaStream_t stream")
 _ARGS_PASS = "x, w, gs, sorted_ids, bexp, npad, out, numel, snumel, nblocks, mode, stream"
@@ -670,11 +748,10 @@ _ARGS_PASS = "x, w, gs, sorted_ids, bexp, npad, out, numel, snumel, nblocks, mod
 
 def _cuda_unit(kind: int, bsm: int) -> str:
     """One .cu translation unit: common code + dispatchers for (kind, bsm). Units compile in parallel."""
-    mats = 2 if kind == 1 else 1
     table = (G1_VARIANTS if kind == 1 else G2_VARIANTS)[bsm]
-    launch = "\n".join(f"  if (variant == {v}) return run<{mats}, {nw}, {g}, {s}, {k}>({_ARGS_PASS});"
+    launch = "\n".join(f"  if (variant == {v}) return run<{kind}, {nw}, {g}, {s}, {k}>({_ARGS_PASS});"
                        for v, (nw, g, s, k) in enumerate(table))
-    attrs = "\n".join(f"  if (variant == {v}) {{ attrs_one<{mats}, {nw}, {g}, {s}, {k}>(o); return; }}"
+    attrs = "\n".join(f"  if (variant == {v}) {{ attrs_one<{kind}, {nw}, {g}, {s}, {k}>(o); return; }}"
                       for v, (nw, g, s, k) in enumerate(table))
     return (_CUDA_COMMON
             + f'\nextern "C" int muse_launch_g{kind}_{bsm}(int variant, {_ARGS_DECL}) {{\n{launch}\n  return -1;\n}}\n'
@@ -683,6 +760,14 @@ def _cuda_unit(kind: int, bsm: int) -> str:
 
 def _cuda_norm_unit() -> str:
     return _CUDA_COMMON + r'''
+extern "C" int muse_route(const void* ids, int numel, int local_start, int bsm, void* local_ids, void* sorted_ids,
+                          int cap, void* bexp, int nblocks, void* npad, cudaStream_t stream) {
+  route_kernel<<<1, 1024, 0, stream>>>(reinterpret_cast<const int*>(ids), numel, local_start, bsm,
+                                       reinterpret_cast<int*>(local_ids), reinterpret_cast<int*>(sorted_ids), cap,
+                                       reinterpret_cast<int*>(bexp), nblocks, reinterpret_cast<int*>(npad));
+  return (int)cudaGetLastError();
+}
+
 extern "C" int muse_post_norm(const void* y, const void* tw, const void* lid, const void* nw, void* out,
                               int m, float eps, cudaStream_t stream) {
   post_norm_kernel<<<m, 256, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(y), reinterpret_cast<const float*>(tw),
@@ -706,11 +791,26 @@ def _cpp_unit() -> str:
                        f"snumel, nblocks, md, stream); break;" for kind in (1, 2) for b in bsms)
     acases = "\n".join(f"    case {kind * 1000 + b}: muse_attrs_g{kind}_{b}(v, o); break;" for kind in (1, 2) for b in bsms)
     decls.append('extern "C" int muse_post_norm(const void*, const void*, const void*, const void*, void*, int, float, void*);')
+    decls.append('extern "C" int muse_route(const void*, int, int, int, void*, void*, int, void*, int, void*, void*);')
     return r'''
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <vector>
 ''' + "\n".join(decls) + r'''
+
+void route(torch::Tensor ids, torch::Tensor local_ids, torch::Tensor sorted_ids, torch::Tensor bexp,
+           torch::Tensor npad, int64_t local_start, int64_t bsm) {
+  TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type() == torch::kInt32, "ids");
+  TORCH_CHECK(local_ids.is_contiguous() && local_ids.scalar_type() == torch::kInt32 && local_ids.numel() == ids.numel(), "local_ids");
+  TORCH_CHECK(sorted_ids.is_contiguous() && sorted_ids.scalar_type() == torch::kInt32, "sorted_ids");
+  TORCH_CHECK(bexp.is_contiguous() && bexp.scalar_type() == torch::kInt32, "bexp");
+  TORCH_CHECK(npad.scalar_type() == torch::kInt32 && npad.numel() >= 1, "npad");
+  TORCH_CHECK(sorted_ids.numel() >= bexp.numel() * bsm, "capacity");
+  int rc = muse_route(ids.data_ptr(), static_cast<int>(ids.numel()), static_cast<int>(local_start), static_cast<int>(bsm),
+                      local_ids.data_ptr(), sorted_ids.data_ptr(), static_cast<int>(sorted_ids.numel()), bexp.data_ptr(),
+                      static_cast<int>(bexp.numel()), npad.data_ptr(), at::cuda::getCurrentCUDAStream().stream());
+  TORCH_CHECK(rc == 0, "route launch failed rc=", rc);
+}
 
 void post_norm(torch::Tensor y, torch::Tensor tw, torch::Tensor lid, torch::Tensor nw, torch::Tensor out, double eps) {
   TORCH_CHECK(y.is_cuda() && y.is_contiguous() && y.scalar_type() == torch::kBFloat16, "y");
@@ -735,8 +835,8 @@ void launch(int64_t kind, torch::Tensor x, torch::Tensor w, torch::Tensor gs, to
   TORCH_CHECK(bexp.is_cuda() && bexp.is_contiguous() && bexp.scalar_type() == torch::kInt32, "block_experts");
   TORCH_CHECK(npad.is_cuda() && npad.scalar_type() == torch::kInt32 && npad.numel() >= 1, "n_padded");
   TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == torch::kBFloat16 && out.size(1) == 4096, "out");
-  const int64_t pieces = (int64_t)32 * 64 * 256;
-  TORCH_CHECK(w.numel() == pieces * (kind == 1 ? 1152 : 576), "w bytes");
+  const int64_t pieces = (int64_t)32 * 64 * (kind == 1 ? 256 : 128);
+  TORCH_CHECK(w.numel() == pieces * 1152, "w bytes");
   const int64_t numel64 = kind == 1 ? x.size(0) * 8 : x.size(0);
   TORCH_CHECK(out.size(0) == numel64, "out rows");
   const int numel = static_cast<int>(numel64);
@@ -767,6 +867,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("launch", &launch);
   m.def("attrs", &attrs);
   m.def("post_norm", &post_norm);
+  m.def("route", &route);
 }
 '''
 
@@ -774,10 +875,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 def _repack(w, sf, mats, half_rows):
     """Repack 32 local experts into the kernel's kt-major fragment layout. Same byte count as the input."""
     rows = w.shape[1]
-    if w.shape != (32, rows, 2048) or sf.shape != (32, rows, 256) or rows != mats * 4096:
+    nt_n = rows // (16 * mats)
+    if w.shape != (32, rows, 2048) or sf.shape != (32, rows, 256) or nt_n * 16 * mats != rows:
         raise RuntimeError(f"unexpected weight shape {tuple(w.shape)} scales {tuple(sf.shape)}")
     dev = w.device
-    ix_np = _pack_indices(256, 64, mats, half_rows)
+    ix_np = _pack_indices(nt_n, 64, mats, half_rows)
     ix = {
         "n": [torch.from_numpy(a).to(dev) for a in ix_np["n"]],
         "kb": [torch.from_numpy(a).to(dev) for a in ix_np["kb"]],
@@ -788,7 +890,7 @@ def _repack(w, sf, mats, half_rows):
     del ix_np
     lut = torch.from_numpy(_scale_code_lut()).to(dev)
     sf_u8 = sf.contiguous().view(torch.uint8)
-    out = torch.empty((32, 64 * 256 * mats * 576), dtype=torch.uint8, device=dev)
+    out = torch.empty((32, 64 * nt_n * mats * 576), dtype=torch.uint8, device=dev)
     for e in range(32):
         out[e] = _pack_expert(
             w[e].contiguous(), lut[sf_u8[e].long()], ix,
@@ -807,7 +909,7 @@ def _build_extension():
 
     from torch.utils.cpp_extension import load
 
-    root = tempfile.mkdtemp(prefix="muse_v8_")
+    root = tempfile.mkdtemp(prefix="muse_v9_")
     sources = []
     cpp = os.path.join(root, "muse_ext.cpp")
     with open(cpp, "w") as f:
@@ -825,7 +927,7 @@ def _build_extension():
             sources.append(path)
     os.environ.setdefault("MAX_JOBS", str(max(4, min(16, os.cpu_count() or 4))))
     return load(
-        name="muse_v8_ext",
+        name="muse_v9_ext",
         sources=sources,
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
@@ -842,7 +944,7 @@ def _compile_new_kernels(weights):
     gs13 = weights["w13_gs"][:32].contiguous().float()
     gs2 = weights["w2_gs"][:32].contiguous().float()
     p13 = _repack(w13, weights["w13_sf"][:32], 2, 4096)
-    p2 = _repack(w2, weights["w2_sf"][:32], 1, 0)
+    p2 = _repack(w2, weights["w2_sf"][:32], 2, 2048)   # rows r and r + 2048 share a unit
     print(f"REPACK w13={p13.nbytes} w2={p2.nbytes} elapsed_s={_elapsed():.1f}", flush=True)
     mod = _build_extension()
     print(f"BUILD_OK elapsed_s={_elapsed():.1f}", flush=True)
@@ -859,7 +961,40 @@ def _compile_new_kernels(weights):
     def _norm(y, topk_weights, local_ids, out):
         mod.post_norm(y, topk_weights, local_ids, nw32, out, POST_NORM_EPS)
 
-    def _forward(data, state, v1=-1, v2=-1, norm=-1):
+    state_ref = [None]
+
+    def _full_custom(data, v1, v2, norm):
+        """route -> GEMM1+silu -> GEMM2 -> post-norm: four launches, no Marlin, no align."""
+        x = data["hidden_states"].contiguous()
+        ids = data["topk_ids"].to(torch.int32).contiguous()
+        topk_weights = data["topk_weights"].to(torch.float32).contiguous()
+        m = x.shape[0]
+        numel = m * TOP_K
+        bsm = _bsm_for(m)
+        nblocks = (numel + 32 * (bsm - 1) + bsm - 1) // bsm
+        dev = x.device
+        local_ids = torch.empty((m, TOP_K), dtype=torch.int32, device=dev)
+        sorted_ids = torch.empty((nblocks * bsm,), dtype=torch.int32, device=dev)
+        bexp = torch.empty((nblocks,), dtype=torch.int32, device=dev)
+        npad = torch.empty((1,), dtype=torch.int32, device=dev)
+        mod.route(ids, local_ids, sorted_ids, bexp, npad, data["config"]["local_start"], bsm)
+        cache2 = torch.empty((numel, 4096), dtype=x.dtype, device=dev)
+        mod.launch(1, x, p13, gs13, sorted_ids, bexp, npad, cache2, bsm, min(v1, len(G1_VARIANTS[bsm]) - 1),
+                   mode_box[0])
+        y = torch.empty((numel, 4096), dtype=x.dtype, device=dev)
+        mod.launch(2, cache2, p2, gs2, sorted_ids, bexp, npad, y, bsm, min(v2, len(G2_VARIANTS[bsm]) - 1),
+                   mode_box[0])
+        y = y.view(m, TOP_K, 4096)
+        if norm:
+            out = torch.empty((m, 4096), dtype=x.dtype, device=dev)
+            mod.post_norm(y, topk_weights, local_ids, nw32, out, POST_NORM_EPS)
+            return out
+        return fused_post_expert_norm_weighted_sum(
+            y, topk_weights, norm_weight=state_ref[0]["norm_w"], eps=POST_NORM_EPS, weight_first=True,
+            slot_expert_ids=local_ids)
+
+    def _forward(data, state, v1=-1, v2=-1, norm=-1, full=False):
+
         cfg = data["config"]
         if (
             cfg["local_start"] != 0
@@ -870,8 +1005,11 @@ def _compile_new_kernels(weights):
             or cfg["n_experts"] != N_EXPERTS
         ):
             return _marlin_forward(data, state)
+        state_ref[0] = state
         if v1 == -1:
-            v1, v2, norm = state["cfg"].get(cfg["bs"], (None, None, False))
+            v1, v2, norm, full = state["cfg"].get(cfg["bs"], (None, None, False, False))
+        if full and v1 is not None and v2 is not None:
+            return _full_custom(data, v1, v2, norm)
         g1 = g2 = None
         if v1 is not None:
             def g1(x, sorted_ids, block_experts, n_padded, out, bsm):
@@ -1089,11 +1227,21 @@ def _gate_shapes(state, device) -> None:
                           lambda d, s, v2=v2: new_fn(d, s, v1=g1_keep, v2=v2, norm=norm), data, state, ref, mode_box)
             if ok and us < best[3]:
                 best = (g1_keep, v2, norm, us)
+        full = False
+        if g1_keep is not None:
+            for v2 in range(len(G2_VARIANTS[bsm])):
+                for nrm in (True, False):
+                    ok, us = _try(name, f"FULL g1={g1_keep} g2={v2} norm={nrm}",
+                                  lambda d, s, v2=v2, nrm=nrm: new_fn(d, s, v1=g1_keep, v2=v2, norm=nrm, full=True),
+                                  data, state, ref, mode_box)
+                    if ok and us < best[3]:
+                        best = (g1_keep, v2, nrm, us)
+                        full = True
         custom = best[0] is not None or best[1] is not None or best[2]
         use_new = custom and best[3] < marlin_us * 0.97
         state["enabled"][bs] = use_new
-        state["cfg"][bs] = (best[0], best[1], best[2])
-        print(f"GATE shape={name} bs={bs} live_experts={live} bsm={bsm} g1={best[0]} g2={best[1]} norm={best[2]} "
+        state["cfg"][bs] = (best[0], best[1], best[2], full)
+        print(f"GATE shape={name} bs={bs} live_experts={live} bsm={bsm} g1={best[0]} g2={best[1]} norm={best[2]} full={full} "
               f"new_us={best[3]:.2f} marlin_us={marlin_us:.2f} speedup={marlin_us / best[3]:.3f} "
               f"choice={'new' if use_new else 'marlin'}", flush=True)
 
@@ -1134,7 +1282,7 @@ def prepare(weights):
     if new_fn is None:
         print(f"COMPILE_FAIL {compile_err}", flush=True)
     else:
-        print(f"COMPILE_OK s4-swapab-tma-splitk-norm prepare_elapsed_s={_elapsed():.1f}", flush=True)
+        print(f"COMPILE_OK s5-full-custom prepare_elapsed_s={_elapsed():.1f}", flush=True)
     try:
         _gate_shapes(state, device)
     except Exception as exc:
