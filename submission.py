@@ -1,12 +1,12 @@
 # okc: problem=muse_moe_w4a16
 # ==================================================================================================
-# v26 — per-token-block completion counters (+ v25's NW=1 GEMM2)
-# Judged score: 1.6776× (`cf3d1f39d2f644ff`)   (previous best: 1.6565× (v24))
-# Built on: v25 (v24 + NW=1 GEMM2 variants)
+# v27 — decode work moved from the ALU pipe to the FMA pipe
+# Judged score: 1.8042× scored (`01b2da2380c44ff8`)   (previous best: 1.6776× (v26))
+# Built on: v26
 #
 # What this version does and why it is faster: see README.md in this folder.
 # Every line that produced this version's speedup is marked with a comment starting
-# 'SPEEDUP (v26)' (search for it). Those comments are the only change from the judged file;
+# 'SPEEDUP (v27)' (search for it). Those comments are the only change from the judged file;
 # no code was altered.
 # ==================================================================================================
 """NVFP4 routed experts on H200.
@@ -279,8 +279,8 @@ __device__ __forceinline__ void mbar_expect_tx(uint64_t* bar, unsigned bytes) {
 }
 __device__ __forceinline__ void tma_1d(void* dst, const void* src, unsigned bytes, uint64_t* bar) {
   asm volatile(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
-      ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)) : "memory");
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;\n"
+      ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)), "l"(0x12F0000000000000ull) : "memory");  // EVICT_FIRST
 }
 __device__ __forceinline__ void mbar_wait(uint64_t* bar, unsigned parity) {
   asm volatile(
@@ -319,15 +319,43 @@ __device__ __forceinline__ void mma16816(float c[4], uint32_t a0, uint32_t a1, u
 __device__ __forceinline__ void deq(uint32_t w, uint32_t r[4]) {
   const uint32_t M = 0x81C081C0u;
   r[0] = w & M;
-  r[1] = __funnelshift_l(w, w, 4) & M;
+  // SPEEDUP (v27): w*16 is an IMAD (FMA pipe) instead of a funnel shift (ALU pipe); identical under mask M.
+  r[1] = (w * 16u) & M;  // == rotl(w,4) & M (wrapped bits are masked); IMAD, not SHF
   r[2] = __funnelshift_l(w, w, 10) & M;
-  r[3] = (__funnelshift_l(w, w, 6) & 0x80C080C0u) | (__funnelshift_l(w, w, 14) & 0x01000100u);
+  r[3] = ((w * 64u) & 0x80C080C0u) | (__funnelshift_l(w, w, 14) & 0x01000100u);  // w*64 == rotl(w,6) under the mask
 }
 
 // Coded scale byte s of u -> bf16x2 (both halves) = scale * 2^60. Then A = w * 2^-66.
-__device__ __forceinline__ uint32_t scale_dup(uint32_t u, int s) {
+__device__ __forceinline__ uint32_t scale_dup(uint32_t u, int s, uint32_t k16) {
   uint32_t x = __byte_perm(u, 0u, 0x4040u | ((unsigned)s << 8) | (unsigned)s);
-  return x * 16u + 0x58805880u;
+  // SPEEDUP (v27): opaque multiplier -> IMAD on the FMA pipe instead of LEA on the saturated ALU pipe.
+  return x * k16 + 0x58805880u;  // k16 == 16 at run time, opaque to ptxas: IMAD (FMA pipe), not LEA (ALU)
+}
+
+// bf16 scale word b holds two scales; multiply a by its low or high half broadcast to both lanes.
+// __hmul2 with __low2bfloat162/__high2bfloat162 folds into HMUL2's .H0_H0/.H1_H1 operand selector.
+// SPEEDUP (v27): broadcast a scale half inside the multiply (HMUL2 .H0_H0/.H1_H1): no PRMT needed.
+__device__ __forceinline__ uint32_t hmul2_lo(uint32_t a, uint32_t b) {
+  const __nv_bfloat162 r = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&a),
+                                   __low2bfloat162(*reinterpret_cast<const __nv_bfloat162*>(&b)));
+  return *reinterpret_cast<const uint32_t*>(&r);
+}
+__device__ __forceinline__ uint32_t hmul2_hi(uint32_t a, uint32_t b) {
+  const __nv_bfloat162 r = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&a),
+                                   __high2bfloat162(*reinterpret_cast<const __nv_bfloat162*>(&b)));
+  return *reinterpret_cast<const uint32_t*>(&r);
+}
+// scale multiply for format SF: SF 1 keeps raw words (scale s = half s & 1); others are pre-duplicated
+template <int SF>
+__device__ __forceinline__ uint32_t hmul2_sc(uint32_t a, uint32_t b, int s) {
+  if constexpr (SF == 1) return (s & 1) ? hmul2_hi(a, b) : hmul2_lo(a, b);
+  else return hmul2(a, b);
+}
+
+// GEMM1 -> GEMM2 activations: keep in L2 (CUTLASS EVICT_LAST policy)
+__device__ __forceinline__ void st_keep_bf16(__nv_bfloat16* p, __nv_bfloat16 v) {
+  asm volatile("st.global.L2::cache_hint.b16 [%0], %1, %2;\n" ::"l"(p), "h"(*reinterpret_cast<unsigned short*>(&v)),
+               "l"(0x14F0000000000000ull) : "memory");
 }
 
 // KIND == 1: GEMM1. A 16-row unit is 16 gate rows + the matching 16 up rows; epilogue silu(gate)*up;
@@ -357,6 +385,7 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
 
   // mode bit 4 (early): GEMM1 lets its dependents launch at once; GEMM2 waits only before its activations.
   const bool early = (mode & 4) != 0;
+  const uint32_t k16 = 16u + ((unsigned)mode >> 30);  // 16; opaque to ptxas
   if (KIND == 1 || !early) pdl_wait();  // inputs come from the previous kernel (PDL launch); no-op on a plain launch
   if (KIND == 1 && early) pdl_trigger();
   const int blk = (int)blockIdx.y;
@@ -456,7 +485,6 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
 #pragma unroll
     for (int s = 0; s < S - 1; ++s) issue_w(s, s);
     if ((mode & 8) && (mode & 3) != 1) {
-      // SPEEDUP (v26): GEMM2 waits for its own token block (256 row units), not the whole GEMM1 grid.
       // Wait only for the GEMM1 CTAs that wrote this token block (256 units); fall back to the grid wait.
       if (tid == 0) {
         const int* done = n_padded + 1 + blk;
@@ -514,20 +542,22 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
         const uint2 u = *reinterpret_cast<const uint2*>(pw + m * MATB + 512 + grp * 8);
 #pragma unroll
         for (int s = 0; s < 4; ++s) {
-          sc[m][0][s] = scale_dup(u.x, s);
-          sc[m][1][s] = scale_dup(u.y, s);
+          sc[m][0][s] = scale_dup(u.x, s, k16);
+          sc[m][1][s] = scale_dup(u.y, s, k16);
         }
       } else if constexpr (SF == 1) {
         // bf16 per scale: rows grp / grp+8, atoms 0..3, two per word -> duplicate the half.
         const uint4 v = *reinterpret_cast<const uint4*>(pw + m * MATB + 512 + grp * 16);
-        sc[m][0][0] = __byte_perm(v.x, 0u, 0x1010u);
-        sc[m][0][1] = __byte_perm(v.x, 0u, 0x3232u);
-        sc[m][0][2] = __byte_perm(v.y, 0u, 0x1010u);
-        sc[m][0][3] = __byte_perm(v.y, 0u, 0x3232u);
-        sc[m][1][0] = __byte_perm(v.z, 0u, 0x1010u);
-        sc[m][1][1] = __byte_perm(v.z, 0u, 0x3232u);
-        sc[m][1][2] = __byte_perm(v.w, 0u, 0x1010u);
-        sc[m][1][3] = __byte_perm(v.w, 0u, 0x3232u);
+        // SPEEDUP (v27): the 8 __byte_perm duplications per matrix per tile are gone.
+        // raw words; hmul2_sc<1> broadcasts half (s & 1) inside the multiply (no PRMT)
+        sc[m][0][0] = v.x;
+        sc[m][0][1] = v.x;
+        sc[m][0][2] = v.y;
+        sc[m][0][3] = v.y;
+        sc[m][1][0] = v.z;
+        sc[m][1][1] = v.z;
+        sc[m][1][2] = v.w;
+        sc[m][1][3] = v.w;
       } else {
         // bf16x2 per scale, already duplicated: load and use.
         const uint4 a = *reinterpret_cast<const uint4*>(pw + m * MATB + 512 + grp * 32);
@@ -552,10 +582,10 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
         for (int m = 0; m < MATS; ++m) {
           uint32_t r[4];
           deq(wv[m][s], r);
-          ag[m][0] = hmul2(r[0], sc[m][0][s]);
-          ag[m][1] = hmul2(r[1], sc[m][1][s]);
-          ag[m][2] = hmul2(r[2], sc[m][0][s]);
-          ag[m][3] = hmul2(r[3], sc[m][1][s]);
+          ag[m][0] = hmul2_sc<SF>(r[0], sc[m][0][s], s);
+          ag[m][1] = hmul2_sc<SF>(r[1], sc[m][1][s], s);
+          ag[m][2] = hmul2_sc<SF>(r[2], sc[m][0][s], s);
+          ag[m][3] = hmul2_sc<SF>(r[3], sc[m][1][s], s);
         }
 #pragma unroll
         for (int g = 0; g < G; ++g) {
@@ -582,10 +612,10 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
         for (int m = 0; m < MATS; ++m) {
           uint32_t r[4];
           deq(wv[m][s], r);
-          const uint32_t a0 = hmul2(r[0], sc[m][0][s]);
-          const uint32_t a1 = hmul2(r[1], sc[m][1][s]);
-          const uint32_t a2 = hmul2(r[2], sc[m][0][s]);
-          const uint32_t a3 = hmul2(r[3], sc[m][1][s]);
+          const uint32_t a0 = hmul2_sc<SF>(r[0], sc[m][0][s], s);
+          const uint32_t a1 = hmul2_sc<SF>(r[1], sc[m][1][s], s);
+          const uint32_t a2 = hmul2_sc<SF>(r[2], sc[m][0][s], s);
+          const uint32_t a3 = hmul2_sc<SF>(r[3], sc[m][1][s], s);
 #pragma unroll
           for (int g = 0; g < G; ++g) {
             if (g * 8 < nact) mma16816(acc[m][g], a0, a1, a2, a3, bfr[g][2 * h], bfr[g][2 * h + 1]);
@@ -639,8 +669,8 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
           const float y0 = acc[1][g][c] * gf;
           const float x1 = acc[0][g][2 + c] * gf;
           const float y1 = acc[1][g][2 + c] * gf;
-          o[row0] = __float2bfloat16(x0 * __frcp_rn(1.0f + __expf(-x0)) * y0);
-          o[row0 + 8] = __float2bfloat16(x1 * __frcp_rn(1.0f + __expf(-x1)) * y1);
+          st_keep_bf16(o + row0, __float2bfloat16(x0 * __frcp_rn(1.0f + __expf(-x0)) * y0));
+          st_keep_bf16(o + row0 + 8, __float2bfloat16(x1 * __frcp_rn(1.0f + __expf(-x1)) * y1));
         } else {
           o[row0] = __float2bfloat16(acc[0][g][c] * gf);
           o[row0 + 8] = __float2bfloat16(acc[0][g][2 + c] * gf);
@@ -654,7 +684,6 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
     if (mode & 8) {
       // Only the NW ks == 0 warps reach here (KS > 1 retires the rest after the reduction).
       asm volatile("bar.sync 1, %0;\n" ::"r"(NW * 32) : "memory");
-      // SPEEDUP (v26): GEMM1 publishes its rows: fence + release-add of its unit count to the block counter.
       if (tid == 0) red_release_gpu(const_cast<int*>(n_padded) + 1 + blk, NW);
     }
   }
@@ -845,7 +874,6 @@ route_kernel(const int* __restrict__ ids, int numel, int local_start, int bsm, i
     int e = -1;
     for (int k = 0; k < 32; ++k) e = (pos >= off[k] && pos < off[k + 1]) ? k : e;
     block_experts[b] = e;
-    // SPEEDUP (v26): the router arms one completion counter per token block.
     n_padded[1 + b] = 0;  // v26 GEMM1 -> GEMM2 block counters
   }
   for (int i = tid; i < numel; i += 1024) {
@@ -879,7 +907,6 @@ G2_VARIANTS = {8: [(4, 1, 6, 1), (2, 1, 8, 1), (2, 1, 4, 4), (4, 1, 4, 2),
                     (4, 4, 104, 2), (4, 4, 204, 2), (4, 4, 103, 2), (4, 4, 203, 2)],
                48: [(8, 6, 4, 1), (4, 6, 4, 2)],
                64: [(8, 8, 4, 1), (4, 8, 5, 1), (4, 8, 3, 2)]}
-# SPEEDUP (v25): NW=1 GEMM2 variants, so GEMM2 can launch as many CTAs per expert as GEMM1.
 # v25: one-unit-per-CTA variants (appended; earlier indices unchanged)
 for _b, _vs in {8: [(1, 1, 104, 4), (1, 1, 4, 4), (1, 1, 204, 4), (1, 1, 104, 8)], 16: [(1, 2, 104, 4), (1, 2, 103, 4), (1, 2, 4, 4), (1, 2, 104, 8)], 32: [(1, 4, 104, 4), (1, 4, 103, 4), (1, 4, 4, 4), (1, 4, 103, 8)], 48: [(1, 6, 104, 4), (1, 6, 4, 4)], 64: [(1, 8, 103, 4), (1, 8, 3, 4)]}.items():
     G2_VARIANTS[_b] = list(G2_VARIANTS[_b]) + _vs
@@ -1064,7 +1091,7 @@ def _build_extension():
 
     from torch.utils.cpp_extension import load
 
-    root = tempfile.mkdtemp(prefix="muse_v26_")
+    root = tempfile.mkdtemp(prefix="muse_v27_")
     sources = []
     cpp = os.path.join(root, "muse_ext.cpp")
     with open(cpp, "w") as f:
@@ -1082,7 +1109,7 @@ def _build_extension():
             sources.append(path)
     os.environ.setdefault("MAX_JOBS", str(max(4, min(16, os.cpu_count() or 4))))
     return load(
-        name="muse_v26_ext",
+        name="muse_v27_ext",
         sources=sources,
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
