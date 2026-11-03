@@ -1,12 +1,12 @@
 # okc: problem=muse_moe_w4a16
 # ==================================================================================================
-# v24 — GEMM2 prefetches its weights before waiting on GEMM1
-# Judged score: 1.6565× scored (`37b2b48ef0f24d22`)   (previous best: 1.6294× (v22))
-# Built on: v22
+# v26 — per-token-block completion counters (+ v25's NW=1 GEMM2)
+# Judged score: 1.6776× (`cf3d1f39d2f644ff`)   (previous best: 1.6565× (v24))
+# Built on: v25 (v24 + NW=1 GEMM2 variants)
 #
 # What this version does and why it is faster: see README.md in this folder.
 # Every line that produced this version's speedup is marked with a comment starting
-# 'SPEEDUP (v24)' (search for it). Those comments are the only change from the judged file;
+# 'SPEEDUP (v26)' (search for it). Those comments are the only change from the judged file;
 # no code was altered.
 # ==================================================================================================
 """NVFP4 routed experts on H200.
@@ -255,6 +255,15 @@ __device__ __forceinline__ void cp16a(unsigned smem, const void* gmem) {
 }
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" :::); }
+__device__ __forceinline__ int ld_acquire_gpu(const int* p) {
+  int v;
+  asm volatile("ld.acquire.gpu.global.s32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ void red_release_gpu(int* p, int v) {
+  asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+  asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n" ::"l"(p), "r"(v) : "memory");
+}
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
 template <int N>
 __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
@@ -347,7 +356,6 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
   static_assert((KS - 1) * NW * MATS * G * 4 * 32 * 4 <= S * STAGE, "reduction buffer");
 
   // mode bit 4 (early): GEMM1 lets its dependents launch at once; GEMM2 waits only before its activations.
-  // SPEEDUP (v24): 'early' mode: GEMM1 releases its dependents at once; GEMM2 waits only before activations.
   const bool early = (mode & 4) != 0;
   if (KIND == 1 || !early) pdl_wait();  // inputs come from the previous kernel (PDL launch); no-op on a plain launch
   if (KIND == 1 && early) pdl_trigger();
@@ -443,12 +451,23 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
 #pragma unroll
       for (int i = 0; i < 4; ++i) acc[m][g][i] = 0.0f;
 
-  // SPEEDUP (v24): weights need only the router's output, so issue their stages before waiting on GEMM1.
   if (KIND == 2 && early) {
     // Weights need only the router's output; stream them while GEMM1 finishes, then wait for its activations.
 #pragma unroll
     for (int s = 0; s < S - 1; ++s) issue_w(s, s);
-    pdl_wait();
+    if ((mode & 8) && (mode & 3) != 1) {
+      // SPEEDUP (v26): GEMM2 waits for its own token block (256 row units), not the whole GEMM1 grid.
+      // Wait only for the GEMM1 CTAs that wrote this token block (256 units); fall back to the grid wait.
+      if (tid == 0) {
+        const int* done = n_padded + 1 + blk;
+        int spins = 0;
+        while (ld_acquire_gpu(done) < 256 && ++spins < (1 << 16)) __nanosleep(32);
+        if (spins >= (1 << 16)) pdl_wait();
+      }
+      __syncthreads();
+    } else {
+      pdl_wait();
+    }
 #pragma unroll
     for (int s = 0; s < S - 1; ++s) {
       issue_a(s, s);
@@ -629,6 +648,14 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
           o[row0 + 2056] = __float2bfloat16(acc[1][g][2 + c] * gf);
         }
       }
+    }
+  }
+  if constexpr (KIND == 1) {
+    if (mode & 8) {
+      // Only the NW ks == 0 warps reach here (KS > 1 retires the rest after the reduction).
+      asm volatile("bar.sync 1, %0;\n" ::"r"(NW * 32) : "memory");
+      // SPEEDUP (v26): GEMM1 publishes its rows: fence + release-add of its unit count to the block counter.
+      if (tid == 0) red_release_gpu(const_cast<int*>(n_padded) + 1 + blk, NW);
     }
   }
 }
@@ -818,6 +845,8 @@ route_kernel(const int* __restrict__ ids, int numel, int local_start, int bsm, i
     int e = -1;
     for (int k = 0; k < 32; ++k) e = (pos >= off[k] && pos < off[k + 1]) ? k : e;
     block_experts[b] = e;
+    // SPEEDUP (v26): the router arms one completion counter per token block.
+    n_padded[1 + b] = 0;  // v26 GEMM1 -> GEMM2 block counters
   }
   for (int i = tid; i < numel; i += 1024) {
     const int l = ids[i] - local_start;
@@ -850,6 +879,14 @@ G2_VARIANTS = {8: [(4, 1, 6, 1), (2, 1, 8, 1), (2, 1, 4, 4), (4, 1, 4, 2),
                     (4, 4, 104, 2), (4, 4, 204, 2), (4, 4, 103, 2), (4, 4, 203, 2)],
                48: [(8, 6, 4, 1), (4, 6, 4, 2)],
                64: [(8, 8, 4, 1), (4, 8, 5, 1), (4, 8, 3, 2)]}
+# SPEEDUP (v25): NW=1 GEMM2 variants, so GEMM2 can launch as many CTAs per expert as GEMM1.
+# v25: one-unit-per-CTA variants (appended; earlier indices unchanged)
+for _b, _vs in {8: [(1, 1, 104, 4), (1, 1, 4, 4), (1, 1, 204, 4), (1, 1, 104, 8)], 16: [(1, 2, 104, 4), (1, 2, 103, 4), (1, 2, 4, 4), (1, 2, 104, 8)], 32: [(1, 4, 104, 4), (1, 4, 103, 4), (1, 4, 4, 4), (1, 4, 103, 8)], 48: [(1, 6, 104, 4), (1, 6, 4, 4)], 64: [(1, 8, 103, 4), (1, 8, 3, 4)]}.items():
+    G2_VARIANTS[_b] = list(G2_VARIANTS[_b]) + _vs
+for _b, _vs in {8: [(1, 1, 104, 4), (1, 1, 4, 4)], 16: [(1, 2, 104, 4)], 32: [(1, 4, 103, 4)]}.items():
+    G1_VARIANTS[_b] = list(G1_VARIANTS[_b]) + _vs
+
+
 def _sf(cfg):
     """Scale format of a variant: the hundreds digit of its stage field."""
     return cfg[2] // 100
@@ -1027,7 +1064,7 @@ def _build_extension():
 
     from torch.utils.cpp_extension import load
 
-    root = tempfile.mkdtemp(prefix="muse_v24_")
+    root = tempfile.mkdtemp(prefix="muse_v26_")
     sources = []
     cpp = os.path.join(root, "muse_ext.cpp")
     with open(cpp, "w") as f:
@@ -1045,7 +1082,7 @@ def _build_extension():
             sources.append(path)
     os.environ.setdefault("MAX_JOBS", str(max(4, min(16, os.cpu_count() or 4))))
     return load(
-        name="muse_v24_ext",
+        name="muse_v26_ext",
         sources=sources,
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
@@ -1098,7 +1135,7 @@ def _compile_new_kernels(weights):
         local_ids = torch.empty((m, TOP_K), dtype=torch.int32, device=dev)
         sorted_ids = torch.empty((nblocks * bsm,), dtype=torch.int32, device=dev)
         bexp = torch.empty((nblocks,), dtype=torch.int32, device=dev)
-        npad = torch.empty((1,), dtype=torch.int32, device=dev)
+        npad = torch.empty((1 + nblocks,), dtype=torch.int32, device=dev)  # [n_padded, block counters]
         mod.route(ids, local_ids, sorted_ids, bexp, npad, data["config"]["local_start"], bsm)
         cache2 = torch.empty((numel, 4096), dtype=x.dtype, device=dev)
         v1 = min(v1, len(G1_VARIANTS[bsm]) - 1)
@@ -1140,12 +1177,12 @@ def _compile_new_kernels(weights):
             def g1(x, sorted_ids, block_experts, n_padded, out, bsm):
                 vv = min(v1, len(G1_VARIANTS[bsm]) - 1)
                 mod.launch(1, x, p13[_sf(G1_VARIANTS[bsm][vv])], gs13, sorted_ids, block_experts, n_padded, out, bsm,
-                           vv, mode_box[0] | pdl_box[0])
+                           vv, (mode_box[0] | pdl_box[0]) & ~8)
         if v2 is not None:
             def g2(x, sorted_ids, block_experts, n_padded, out, bsm):
                 vv = min(v2, len(G2_VARIANTS[bsm]) - 1)
                 mod.launch(2, x, p2[_sf(G2_VARIANTS[bsm][vv])], gs2, sorted_ids, block_experts, n_padded, out, bsm,
-                           vv, mode_box[0] | pdl_box[0])
+                           vv, (mode_box[0] | pdl_box[0]) & ~8)
         return _marlin_forward(data, state, gemm1=g1, gemm2=g2, norm=_norm if norm else None)
 
     return _forward, mode_box, pdl_box
@@ -1367,6 +1404,7 @@ def _gate_shapes(state, device) -> None:
         nonfull_us = best[3]
         full_us = float("inf")
         early_us = float("inf")
+        flags_us = float("inf")
         full = False
         if g1_keep is not None:
             for v2 in range(len(G2_VARIANTS[bsm])):
@@ -1440,6 +1478,17 @@ def _gate_shapes(state, device) -> None:
                 if ok and us < best[3]:
                     best = (best[0], best[1], best[2], us)
                     pdl_on = 260
+            if pdl_on and full and state.get("flags_ok") and best[1] is not None:
+                pbox[0] = 268
+                ok, us = _try(name, f"FLAGS g1={best[0]} g2={best[1]} norm={best[2]} full={full} bsm={tile}",
+                              lambda d, s, c=cfg5: new_fn(d, s, v1=c[0], v2=c[1], norm=c[2], full=c[3], bsm=c[4]),
+                              data, state, ref, mode_box)
+                pbox[0] = 256
+                flags_us = us if ok else float("inf")
+                print(f"FLAGS shape={name} flags_us={us:.2f} best_us={best[3]:.2f}", flush=True)
+                if ok and us < best[3]:
+                    best = (best[0], best[1], best[2], us)
+                    pdl_on = 268
         state["pdl"][bs] = pdl_on
         use_new = custom and best[3] < marlin_us * 0.97
         state["enabled"][bs] = use_new
@@ -1449,7 +1498,7 @@ def _gate_shapes(state, device) -> None:
               f"choice={'new' if use_new else 'marlin'}", flush=True)
         summary.append(f"SUMMARY shape={name} choice={'new' if use_new else 'marlin'} cfg={state['cfg'][bs]} "
                        f"pdl={pdl_on} new_us={best[3]:.2f} marlin_us={marlin_us:.2f} nonfull_best_us={nonfull_us:.2f} "
-                       f"full_best_us={full_us:.2f} early_us={early_us:.2f}")
+                       f"full_best_us={full_us:.2f} early_us={early_us:.2f} flags_us={flags_us:.2f}")
 
 
 def _pdl_selftest(state, device):
@@ -1474,7 +1523,7 @@ def _pdl_selftest(state, device):
         raise RuntimeError("PDL graph replay differs from eager")
 
 
-def _early_selftest(state, device):
+def _early_selftest(state, device, mode=260):
     new_fn = state["new_fn"]
     pbox = state["pdl_box"]
     bank = state["banks"][(0, 32)]
@@ -1484,7 +1533,7 @@ def _early_selftest(state, device):
         pbox[0] = 0
         ref = fn().clone()
         torch.cuda.synchronize()
-        pbox[0] = 260
+        pbox[0] = mode
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
@@ -1498,7 +1547,7 @@ def _early_selftest(state, device):
             g.replay()
             torch.cuda.synchronize()
             if not torch.equal(out, ref):
-                raise RuntimeError(f"early-prefetch replay differs from plain launch at bs={bs}")
+                raise RuntimeError(f"mode {mode} replay differs from plain launch at bs={bs}")
         del g
 
 
@@ -1559,6 +1608,16 @@ def prepare(weights):
             print("EARLY_OK", flush=True)
         except Exception as exc:
             print(f"EARLY_DISABLED {type(exc).__name__}: {str(exc)[:300]}", flush=True)
+        finally:
+            state["pdl_box"][0] = 256
+    state["flags_ok"] = False
+    if state["early_ok"]:
+        try:
+            _early_selftest(state, device, mode=268)
+            state["flags_ok"] = True
+            print("FLAGS_OK", flush=True)
+        except Exception as exc:
+            print(f"FLAGS_DISABLED {type(exc).__name__}: {str(exc)[:300]}", flush=True)
         finally:
             state["pdl_box"][0] = 256
     try:
