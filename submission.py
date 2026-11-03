@@ -1,12 +1,12 @@
 # okc: problem=muse_moe_w4a16
 # ==================================================================================================
-# v21 — scales pre-converted (memoized) in prepare()
-# Judged score: 1.6253× (`27dd3086169e4155`)   (previous best: 1.5532× (v16))
-# Built on: v16
+# v22 — programmatic dependent launch (PDL) + lighter loop bookkeeping
+# Judged score: 1.6294× scored (`a2cff897065f4452`)   (previous best: 1.6253× (v21))
+# Built on: v21
 #
 # What this version does and why it is faster: see README.md in this folder.
 # Every line that produced this version's speedup is marked with a comment starting
-# 'SPEEDUP (v21)' (search for it). Those comments are the only change from the judged file;
+# 'SPEEDUP (v22)' (search for it). Those comments are the only change from the judged file;
 # no code was altered.
 # ==================================================================================================
 """NVFP4 routed experts on H200.
@@ -222,7 +222,6 @@ def _pack_expert(w_e, sfc_e, ix, stack, cat, fmt=0):
     words = words.reshape(kt_n, nt_n, mats, 512)
     sc = sfc_e[ix["sn"], ix["sk"]].reshape(kt_n, nt_n, mats, 64)
     if fmt:
-        # SPEEDUP (v21): convert the scales once at setup: exactly what the kernel's scale_dup computed.
         # Memoized scale conversion: the exact bf16 bits the kernel's scale_dup produces, (code << 4) + 0x5880,
         # stored as bf16 (fmt 1) or as the duplicated bf16x2 word (fmt 2), little-endian.
         h = (sc.to(torch.int32) << 4) + 0x5880
@@ -254,6 +253,9 @@ __device__ __forceinline__ void cp16(void* smem, const void* gmem) {
 __device__ __forceinline__ void cp16a(unsigned smem, const void* gmem) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem), "l"(gmem) : "memory");
 }
+// SPEEDUP (v22): PDL primitives. wait = block until the previous grid finished; trigger = let the next grid launch.
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
+__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" :::); }
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
 template <int N>
 __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
@@ -345,6 +347,8 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
   static_assert(KT % KS == 0, "KS must divide 64");
   static_assert((KS - 1) * NW * MATS * G * 4 * 32 * 4 <= S * STAGE, "reduction buffer");
 
+  // SPEEDUP (v22): GEMM CTAs are already resident when the previous kernel ends; they start immediately.
+  pdl_wait();  // inputs come from the previous kernel (PDL launch); no-op on a plain launch
   const int blk = (int)blockIdx.y;
   if (blk * T >= *n_padded) return;
   const int expert = block_experts[blk];
@@ -437,19 +441,25 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
     cp_commit();
   }
 
+  const bool loads_only = (mode == 1);
+  const char* const sbase0 = stages + ks * SUB;  // this warp's K slice in stage 0
+  int st = 0;           // stage consumed this tile
+  int ist = S - 1;      // stage the next issue fills
+  unsigned par = 0u;    // mbarrier phase parity of stage st
   for (int kt = 0; kt < KTO; ++kt) {
-    const int st = kt % S;
     cp_wait<S - 2>();
-    mbar_wait(&bars[st], (unsigned)((kt / S) & 1));
+    mbar_wait(&bars[st], par);
     __syncthreads();
     {
-      const int nk = kt + S - 1;
-      if (nk < KTO) issue(nk, nk % S);
+      if (kt + S - 1 < KTO) issue(kt + S - 1, ist);
       cp_commit();
+      ist = (ist == S - 1) ? 0 : ist + 1;
     }
-    if (mode == 1) continue;
+    const char* sbase = sbase0 + st * STAGE;
+    st = (st == S - 1) ? 0 : st + 1;
+    par ^= (st == 0) ? 1u : 0u;
+    if (loads_only) continue;
 
-    const char* sbase = stages + st * STAGE + ks * SUB;
     const char* pw = sbase + unit * PIECE;
     uint32_t wv[MATS][4];
     uint32_t sc[MATS][2][4];
@@ -467,7 +477,6 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
           sc[m][0][s] = scale_dup(u.x, s);
           sc[m][1][s] = scale_dup(u.y, s);
         }
-      // SPEEDUP (v21): bf16 scales come pre-converted; only a byte_perm to duplicate the half remains.
       } else if constexpr (SF == 1) {
         // bf16 per scale: rows grp / grp+8, atoms 0..3, two per word -> duplicate the half.
         const uint4 v = *reinterpret_cast<const uint4*>(pw + m * MATB + 512 + grp * 16);
@@ -547,6 +556,8 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
     }
   }
 
+  // SPEEDUP (v22): after the K loop, allow the next kernel to start launching during our epilogue.
+  pdl_trigger();  // main work done: let the next kernel's CTAs start launching
   if (mode == 1) return;
   if constexpr (KS > 1) {
     // Sum the KS partial accumulators of each 16-row unit through shared memory (lane-fastest).
@@ -608,6 +619,22 @@ struct Cfg {
       (size_t)(S % 100) * KS * (NW * 2 * (512 + (64 << (S / 100))) + G * 8 * ACT_LD * 2) + (size_t)G * 8 * 8 + 128;
 };
 
+// Launch with or without programmatic stream serialization (PDL).
+template <typename... KArgs, typename... Args>
+int pdl_launch(void (*k)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t stream, bool pdl, Args... args) {
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid;
+  cfg.blockDim = block;
+  cfg.dynamicSmemBytes = smem;
+  cfg.stream = stream;
+  cudaLaunchAttribute at[1];
+  at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  at[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = at;
+  cfg.numAttrs = pdl ? 1 : 0;
+  return (int)cudaLaunchKernelEx(&cfg, k, static_cast<KArgs>(args)...);
+}
+
 template <int KIND, int NW, int G, int S, int KS>
 int run(const void* x, const void* w, const void* gs, const void* sorted_ids, const void* bexp,
         const void* npad, void* out, int numel, int snumel, int nblocks, int mode, cudaStream_t stream) {
@@ -619,12 +646,12 @@ int run(const void* x, const void* w, const void* gs, const void* sorted_ids, co
   }
   dim3 grid((KIND == 1 ? 256 : 128) / NW, nblocks);
   dim3 block(NW * KS * 32);
-  moe_gemm_kernel<KIND, NW, G, S, KS><<<grid, block, Cfg<KIND, NW, G, S, KS>::smem, stream>>>(
-      reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const uint8_t*>(w),
-      reinterpret_cast<const float*>(gs), reinterpret_cast<const int*>(sorted_ids),
-      reinterpret_cast<const int*>(bexp), reinterpret_cast<const int*>(npad),
-      reinterpret_cast<__nv_bfloat16*>(out), numel, snumel, mode);
-  return (int)cudaGetLastError();
+  return pdl_launch(moe_gemm_kernel<KIND, NW, G, S, KS>, grid, block, Cfg<KIND, NW, G, S, KS>::smem, stream,
+                    (mode & 256) != 0,
+                    reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const uint8_t*>(w),
+                    reinterpret_cast<const float*>(gs), reinterpret_cast<const int*>(sorted_ids),
+                    reinterpret_cast<const int*>(bexp), reinterpret_cast<const int*>(npad),
+                    reinterpret_cast<__nv_bfloat16*>(out), numel, snumel, mode & 255);
 }
 
 template <int KIND, int NW, int G, int S, int KS>
@@ -650,6 +677,7 @@ __global__ void __launch_bounds__(256)
 post_norm_kernel(const __nv_bfloat16* __restrict__ Y, const float* __restrict__ TW, const int* __restrict__ LID,
                  const float* __restrict__ NWT, __nv_bfloat16* __restrict__ OUT, float eps) {
   __shared__ float red[8][8];
+  pdl_wait();
   const int t = (int)blockIdx.x;
   const int tid = (int)threadIdx.x;
   const int lane = tid & 31;
@@ -744,6 +772,7 @@ route_kernel(const int* __restrict__ ids, int numel, int local_start, int bsm, i
   __shared__ int cnt[32];
   __shared__ int off[33];
   __shared__ int fill[32];
+  pdl_trigger();  // GEMM1's CTAs may launch now; they wait for this grid before reading its output
   const int tid = (int)threadIdx.x;
   if (tid < 32) {
     cnt[tid] = 0;
@@ -834,11 +863,11 @@ extern "C" int muse_route(const void* ids, int numel, int local_start, int bsm, 
 }
 
 extern "C" int muse_post_norm(const void* y, const void* tw, const void* lid, const void* nw, void* out,
-                              int m, float eps, cudaStream_t stream) {
-  post_norm_kernel<<<m, 256, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(y), reinterpret_cast<const float*>(tw),
-                                           reinterpret_cast<const int*>(lid), reinterpret_cast<const float*>(nw),
-                                           reinterpret_cast<__nv_bfloat16*>(out), eps);
-  return (int)cudaGetLastError();
+                              int m, float eps, int pdl, cudaStream_t stream) {
+  return pdl_launch(post_norm_kernel, dim3(m), dim3(256), 0, stream, pdl != 0,
+                    reinterpret_cast<const __nv_bfloat16*>(y), reinterpret_cast<const float*>(tw),
+                    reinterpret_cast<const int*>(lid), reinterpret_cast<const float*>(nw),
+                    reinterpret_cast<__nv_bfloat16*>(out), eps);
 }
 '''
 
@@ -855,7 +884,7 @@ def _cpp_unit() -> str:
                        f"gs.data_ptr(), sid.data_ptr(), bexp.data_ptr(), npad.data_ptr(), out.data_ptr(), numel, "
                        f"snumel, nblocks, md, stream); break;" for kind in (1, 2) for b in bsms)
     acases = "\n".join(f"    case {kind * 1000 + b}: muse_attrs_g{kind}_{b}(v, o); break;" for kind in (1, 2) for b in bsms)
-    decls.append('extern "C" int muse_post_norm(const void*, const void*, const void*, const void*, void*, int, float, void*);')
+    decls.append('extern "C" int muse_post_norm(const void*, const void*, const void*, const void*, void*, int, float, int, void*);')
     decls.append('extern "C" int muse_route(const void*, int, int, int, void*, void*, int, void*, int, void*, void*);')
     return r'''
 #include <torch/extension.h>
@@ -877,7 +906,8 @@ void route(torch::Tensor ids, torch::Tensor local_ids, torch::Tensor sorted_ids,
   TORCH_CHECK(rc == 0, "route launch failed rc=", rc);
 }
 
-void post_norm(torch::Tensor y, torch::Tensor tw, torch::Tensor lid, torch::Tensor nw, torch::Tensor out, double eps) {
+void post_norm(torch::Tensor y, torch::Tensor tw, torch::Tensor lid, torch::Tensor nw, torch::Tensor out, double eps,
+               int64_t pdl) {
   TORCH_CHECK(y.is_cuda() && y.is_contiguous() && y.scalar_type() == torch::kBFloat16, "y");
   TORCH_CHECK(tw.is_cuda() && tw.is_contiguous() && tw.scalar_type() == torch::kFloat32, "tw");
   TORCH_CHECK(lid.is_cuda() && lid.is_contiguous() && lid.scalar_type() == torch::kInt32, "lid");
@@ -886,7 +916,8 @@ void post_norm(torch::Tensor y, torch::Tensor tw, torch::Tensor lid, torch::Tens
   const int64_t m = out.size(0);
   TORCH_CHECK(out.size(1) == 4096 && y.numel() == m * 8 * 4096 && tw.numel() == m * 8 && lid.numel() == m * 8, "shapes");
   int rc = muse_post_norm(y.data_ptr(), tw.data_ptr(), lid.data_ptr(), nw.data_ptr(), out.data_ptr(),
-                          static_cast<int>(m), static_cast<float>(eps), at::cuda::getCurrentCUDAStream().stream());
+                          static_cast<int>(m), static_cast<float>(eps), static_cast<int>(pdl),
+                          at::cuda::getCurrentCUDAStream().stream());
   TORCH_CHECK(rc == 0, "post_norm launch failed rc=", rc);
 }
 
@@ -976,7 +1007,7 @@ def _build_extension():
 
     from torch.utils.cpp_extension import load
 
-    root = tempfile.mkdtemp(prefix="muse_v21_")
+    root = tempfile.mkdtemp(prefix="muse_v22_")
     sources = []
     cpp = os.path.join(root, "muse_ext.cpp")
     with open(cpp, "w") as f:
@@ -994,7 +1025,7 @@ def _build_extension():
             sources.append(path)
     os.environ.setdefault("MAX_JOBS", str(max(4, min(16, os.cpu_count() or 4))))
     return load(
-        name="muse_v21_ext",
+        name="muse_v22_ext",
         sources=sources,
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
@@ -1024,11 +1055,12 @@ def _compile_new_kernels(weights):
                 print(f"KERNEL_ATTR gemm{kind} bsm={bsm} variant={v} warps_x_ks={nw} stages={stages} regs={regs} "
                       f"local_bytes={lmem} smem_dyn={smem_d} ctas_per_sm={occ}", flush=True)
     mode_box = [0]
+    pdl_box = [256]  # 256: launch our kernels with PDL; 0: plain launches
 
     nw32 = (weights["post_norm_w"].float() + 1.0).contiguous()
 
     def _norm(y, topk_weights, local_ids, out):
-        mod.post_norm(y, topk_weights, local_ids, nw32, out, POST_NORM_EPS)
+        mod.post_norm(y, topk_weights, local_ids, nw32, out, POST_NORM_EPS, 1 if pdl_box[0] else 0)
 
     state_ref = [None]
 
@@ -1052,14 +1084,14 @@ def _compile_new_kernels(weights):
         v1 = min(v1, len(G1_VARIANTS[bsm]) - 1)
         v2 = min(v2, len(G2_VARIANTS[bsm]) - 1)
         mod.launch(1, x, p13[_sf(G1_VARIANTS[bsm][v1])], gs13, sorted_ids, bexp, npad, cache2, bsm, v1,
-                   mode_box[0])
+                   mode_box[0] | pdl_box[0])
         y = torch.empty((numel, 4096), dtype=x.dtype, device=dev)
         mod.launch(2, cache2, p2[_sf(G2_VARIANTS[bsm][v2])], gs2, sorted_ids, bexp, npad, y, bsm, v2,
-                   mode_box[0])
+                   mode_box[0] | pdl_box[0])
         y = y.view(m, TOP_K, 4096)
         if norm:
             out = torch.empty((m, 4096), dtype=x.dtype, device=dev)
-            mod.post_norm(y, topk_weights, local_ids, nw32, out, POST_NORM_EPS)
+            mod.post_norm(y, topk_weights, local_ids, nw32, out, POST_NORM_EPS, 1 if pdl_box[0] else 0)
             return out
         return fused_post_expert_norm_weighted_sum(
             y, topk_weights, norm_weight=state_ref[0]["norm_w"], eps=POST_NORM_EPS, weight_first=True,
@@ -1080,6 +1112,7 @@ def _compile_new_kernels(weights):
         state_ref[0] = state
         if v1 == -1:
             v1, v2, norm, full, bsm = state["cfg"].get(cfg["bs"], (None, None, False, False, None))
+            pdl_box[0] = state["pdl"].get(cfg["bs"], 256 if state.get("pdl_ok") else 0)
         if full and v1 is not None and v2 is not None:
             return _full_custom(data, v1, v2, norm, bsm)
         g1 = g2 = None
@@ -1087,15 +1120,15 @@ def _compile_new_kernels(weights):
             def g1(x, sorted_ids, block_experts, n_padded, out, bsm):
                 vv = min(v1, len(G1_VARIANTS[bsm]) - 1)
                 mod.launch(1, x, p13[_sf(G1_VARIANTS[bsm][vv])], gs13, sorted_ids, block_experts, n_padded, out, bsm,
-                           vv, mode_box[0])
+                           vv, mode_box[0] | pdl_box[0])
         if v2 is not None:
             def g2(x, sorted_ids, block_experts, n_padded, out, bsm):
                 vv = min(v2, len(G2_VARIANTS[bsm]) - 1)
                 mod.launch(2, x, p2[_sf(G2_VARIANTS[bsm][vv])], gs2, sorted_ids, block_experts, n_padded, out, bsm,
-                           vv, mode_box[0])
+                           vv, mode_box[0] | pdl_box[0])
         return _marlin_forward(data, state, gemm1=g1, gemm2=g2, norm=_norm if norm else None)
 
-    return _forward, mode_box
+    return _forward, mode_box, pdl_box
 
 
 def _metrics(output, ref) -> tuple[bool, float, float]:
@@ -1357,12 +1390,48 @@ def _gate_shapes(state, device) -> None:
             if ok and us < best[3]:
                 best = (best[0], best[1], False, us)
         custom = best[0] is not None or best[1] is not None or best[2]
+        pdl_on = 256 if state["pdl_ok"] else 0
+        if custom and state["pdl_ok"]:
+            pbox = state["pdl_box"]
+            cfg5 = (best[0], best[1], best[2], full, tile)
+            pbox[0] = 0
+            ok, us = _try(name, f"PDL off g1={best[0]} g2={best[1]} norm={best[2]} full={full} bsm={tile}",
+                          lambda d, s, c=cfg5: new_fn(d, s, v1=c[0], v2=c[1], norm=c[2], full=c[3], bsm=c[4]),
+                          data, state, ref, mode_box)
+            pbox[0] = 256
+            print(f"PDL shape={name} on_us={best[3]:.2f} off_us={us:.2f}", flush=True)
+            if ok and us < best[3]:
+                best = (best[0], best[1], best[2], us)
+                pdl_on = 0
+        state["pdl"][bs] = pdl_on
         use_new = custom and best[3] < marlin_us * 0.97
         state["enabled"][bs] = use_new
         state["cfg"][bs] = (best[0], best[1], best[2], full, tile)
         print(f"GATE shape={name} bs={bs} live_experts={live} bsm={tile or bsm} g1={best[0]} g2={best[1]} norm={best[2]} full={full} "
               f"new_us={best[3]:.2f} marlin_us={marlin_us:.2f} speedup={marlin_us / best[3]:.3f} "
               f"choice={'new' if use_new else 'marlin'}", flush=True)
+
+
+def _pdl_selftest(state, device):
+    new_fn = state["new_fn"]
+    bank = state["banks"][(0, 32)]
+    data = _random_routed(8, device, state["norm_w"].shape[0], bank["size_n"], seed=4242)
+    fn = lambda: new_fn(data, state, v1=0, v2=0, norm=True, full=True)  # noqa: E731
+    ref = fn().clone()
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        fn()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out = fn()
+    g.replay()
+    torch.cuda.synchronize()
+    if not torch.allclose(out.float(), ref.float(), rtol=0, atol=0):
+        raise RuntimeError("PDL graph replay differs from eager")
 
 
 def prepare(weights):
@@ -1372,8 +1441,9 @@ def prepare(weights):
     device = weights["w13"].device
     # Our repack reads the raw NVFP4 tensors, so it runs before Marlin's (which may reuse storage).
     new_fn, mode_box, compile_err = None, [0], None
+    pdl_box = [0]
     try:
-        new_fn, mode_box = _compile_new_kernels(weights)
+        new_fn, mode_box, pdl_box = _compile_new_kernels(weights)
     except Exception as exc:
         msg = str(exc)
         compile_err = f"{type(exc).__name__}: {msg[-4000:]}"
@@ -1396,12 +1466,23 @@ def prepare(weights):
         "enabled": {},
         "new_fn": new_fn,
         "mode_box": mode_box,
+        "pdl_box": pdl_box,
+        "pdl": {},
         "cfg": {},
     }
     if new_fn is None:
         print(f"COMPILE_FAIL {compile_err}", flush=True)
     else:
         print(f"COMPILE_OK s5-full-custom prepare_elapsed_s={_elapsed():.1f}", flush=True)
+    state["pdl_ok"] = False
+    if state["new_fn"] is not None:
+        try:
+            _pdl_selftest(state, device)
+            state["pdl_ok"] = True
+            print("PDL_OK", flush=True)
+        except Exception as exc:
+            state["pdl_box"][0] = 0
+            print(f"PDL_DISABLED {type(exc).__name__}: {str(exc)[:300]}", flush=True)
     try:
         _gate_shapes(state, device)
     except Exception as exc:
