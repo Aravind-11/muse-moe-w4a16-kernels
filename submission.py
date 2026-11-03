@@ -1,12 +1,12 @@
 # okc: problem=muse_moe_w4a16
 # ==================================================================================================
-# v15 — per-shape token-tile search
-# Judged score: 1.4018× (`8eb6b3747d7d4ad9`)   (previous best: 1.2583× (v9 scored))
-# Built on: v9g (v9 with gate fixes); the CUDA kernel is unchanged
+# v16 — activation-gather addresses hoisted out of the K loop
+# Judged score: 1.5532× (`2a8a1508d44f46d4`; second run 1.5585×)   (previous best: 1.4018× (v15))
+# Built on: v15
 #
 # What this version does and why it is faster: see README.md in this folder.
 # Every line that produced this version's speedup is marked with a comment starting
-# 'SPEEDUP (v15)' (search for it). Those comments are the only change from the judged file;
+# 'SPEEDUP (v16)' (search for it). Those comments are the only change from the judged file;
 # no code was altered.
 # ==================================================================================================
 """NVFP4 routed experts on H200.
@@ -94,7 +94,6 @@ SCORED_SHAPES = (
 GATE_WARMUP = 3
 GATE_ITERS = 7
 # Token tiles the gate also tries on the full custom path (smaller than the shape's default).
-# SPEEDUP (v15): token tiles the gate tries below each shape's default.
 TILE_CANDIDATES = (8, 16, 32)
 GRAPH_ITERS = 21
 GEMM1_EXPERT_BYTES = 8192 * (2048 + 256)   # packed weights + scales of one local expert's W13
@@ -245,6 +244,9 @@ __device__ __forceinline__ unsigned smem_u32(const void* p) {
 __device__ __forceinline__ void cp16(void* smem, const void* gmem) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_u32(smem)), "l"(gmem) : "memory");
 }
+__device__ __forceinline__ void cp16a(unsigned smem, const void* gmem) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem), "l"(gmem) : "memory");
+}
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
 template <int N>
 __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
@@ -375,6 +377,28 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
   const int nchunk = (int)blockIdx.x;
   const uint8_t* wsrc = W + ((size_t)expert * KT * NTU + (size_t)nchunk * NW) * PIECE;
 
+  // SPEEDUP (v16): copy addresses are computed once here instead of on every K tile.
+  // Activation gather plan, fixed for the whole K loop: chunk i = tid + j*NTH is token tok's 16-byte
+  // piece c of K sub-tile k2. Per tile only the K offset (and the stage) changes.
+  constexpr int NCH = KS * T * 8;
+  constexpr int CPT = (NCH + NTH - 1) / NTH;
+  const __nv_bfloat16* asrc[CPT];
+  unsigned adst[CPT];
+  bool aval[CPT];
+  const unsigned sbase_u32 = smem_u32(stages);
+#pragma unroll
+  for (int j = 0; j < CPT; ++j) {
+    const int i = tid + j * NTH;
+    const int k2 = i / (T * 8);
+    const int jj = i - k2 * (T * 8);
+    const int tok = jj >> 3;
+    const int c = jj & 7;
+    const int off = (i < NCH) ? tokoff[tok] : -1;
+    aval[j] = off >= 0;
+    asrc[j] = X + (aval[j] ? off : 0) + k2 * 64 + c * 8;
+    adst[j] = sbase_u32 + (unsigned)(k2 * SUB + SUB_W + tok * (ACT_LD * 2) + c * 16);
+  }
+
   auto issue = [&](int kto, int st) {
     char* sbase = stages + st * STAGE;
     if (tid == 0) {
@@ -384,14 +408,10 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
         tma_1d(sbase + k2 * SUB, wsrc + (size_t)(kto * KS + k2) * NTU * PIECE, (unsigned)SUB_W, &bars[st]);
       }
     }
-    for (int i = tid; i < KS * T * 8; i += NTH) {
-      const int k2 = i / (T * 8);
-      const int j = i - k2 * (T * 8);
-      const int tok = j >> 3;
-      const int c = j & 7;
-      const int off = tokoff[tok];
-      if (off >= 0)
-        cp16(sbase + k2 * SUB + SUB_W + tok * (ACT_LD * 2) + c * 16, X + off + (kto * KS + k2) * 64 + c * 8);
+#pragma unroll
+    for (int j = 0; j < CPT; ++j) {
+      // SPEEDUP (v16): per tile only the K and stage offsets are added.
+      if (aval[j]) cp16a(adst[j] + (unsigned)(st * STAGE), asrc[j] + kto * (KS * 64));
     }
   };
 
@@ -909,7 +929,7 @@ def _build_extension():
 
     from torch.utils.cpp_extension import load
 
-    root = tempfile.mkdtemp(prefix="muse_v15_")
+    root = tempfile.mkdtemp(prefix="muse_v16_")
     sources = []
     cpp = os.path.join(root, "muse_ext.cpp")
     with open(cpp, "w") as f:
@@ -927,7 +947,7 @@ def _build_extension():
             sources.append(path)
     os.environ.setdefault("MAX_JOBS", str(max(4, min(16, os.cpu_count() or 4))))
     return load(
-        name="muse_v15_ext",
+        name="muse_v16_ext",
         sources=sources,
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
@@ -1247,7 +1267,6 @@ def _gate_shapes(state, device) -> None:
                         best = (g1_keep, v2, nrm, us)
                         full = True
         tile = None
-        # SPEEDUP (v15): time every smaller tile x every GEMM1/GEMM2 variant pair; keep the fastest correct one.
         for tb in TILE_CANDIDATES:
             if tb >= bsm:
                 continue
