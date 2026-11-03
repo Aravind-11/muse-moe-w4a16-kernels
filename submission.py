@@ -1,12 +1,12 @@
 # okc: problem=muse_moe_w4a16
 # ==================================================================================================
-# v31 — routing folded into the GEMM CTAs (decode-1)
-# Judged score: 1.8541× scored (`cfd709c24f694754`)   (previous best: 1.8458× (v28))
-# Built on: v28
+# v35 — final board version (v32 correctness guard + wgmma variants)
+# Judged score: 1.8696× scored (`366c4a635e5f4b01`), rank 508 of 1,194   (previous best: 1.8541× (v31))
+# Built on: v32 (v31 + a guard that the router fold runs only with the custom norm)
 #
 # What this version does and why it is faster: see README.md in this folder.
 # Every line that produced this version's speedup is marked with a comment starting
-# 'SPEEDUP (v31)' (search for it). Those comments are the only change from the judged file;
+# 'SPEEDUP (v35)' (search for it). Those comments are the only change from the judged file;
 # no code was altered.
 # ==================================================================================================
 """NVFP4 routed experts on H200.
@@ -315,6 +315,85 @@ __device__ __forceinline__ void mma16816(float c[4], uint32_t a0, uint32_t a1, u
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+
+// ---- Hopper warpgroup MMA (wgmma) helpers (v35; from v18-v20) ----
+__device__ __forceinline__ void wg_fence() {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void wg_commit() {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void wg_wait0() {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
+__device__ __forceinline__ void keep_f(float& x) { asm volatile("" : "+f"(x)::"memory"); }
+__device__ __forceinline__ void keep_r(uint32_t x) { asm volatile("" ::"r"(x) : "memory"); }
+// Shared-memory matrix descriptor, no swizzle: start address, leading / stride byte offsets (16-B units).
+__device__ __forceinline__ uint64_t wg_desc(unsigned addr, unsigned lbo, unsigned sbo) {
+  return (uint64_t)((addr & 0x3FFFF) >> 4) | ((uint64_t)((lbo & 0x3FFFF) >> 4) << 16) |
+         ((uint64_t)((sbo & 0x3FFFF) >> 4) << 32);
+}
+
+template <int G>
+__device__ __forceinline__ void wgmma_rs(float* d, const uint32_t* a, uint64_t desc);
+
+template <>
+__device__ __forceinline__ void wgmma_rs<1>(float* d, const uint32_t* a, uint64_t desc) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, 1, 0;\n"
+               "wgmma.mma_async.sync.aligned.m64n8k16.f32.bf16.bf16 {%0, %1, %2, %3}, {%4, %5, %6, %7}, %8, p, 1, 1, 0;\n}\n"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc) : "memory");
+#endif
+}
+
+template <>
+__device__ __forceinline__ void wgmma_rs<2>(float* d, const uint32_t* a, uint64_t desc) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, 1, 0;\n"
+               "wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11}, %12, p, 1, 1, 0;\n}\n"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc) : "memory");
+#endif
+}
+
+template <>
+__device__ __forceinline__ void wgmma_rs<4>(float* d, const uint32_t* a, uint64_t desc) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, 1, 0;\n"
+               "wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, {%16, %17, %18, %19}, %20, p, 1, 1, 0;\n}\n"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc) : "memory");
+#endif
+}
+
+template <>
+__device__ __forceinline__ void wgmma_rs<6>(float* d, const uint32_t* a, uint64_t desc) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, 1, 0;\n"
+               "wgmma.mma_async.sync.aligned.m64n48k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23}, {%24, %25, %26, %27}, %28, p, 1, 1, 0;\n}\n"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc) : "memory");
+#endif
+}
+
+template <>
+__device__ __forceinline__ void wgmma_rs<8>(float* d, const uint32_t* a, uint64_t desc) {
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+  asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, 1, 0;\n"
+               "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, p, 1, 1, 0;\n}\n"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc) : "memory");
+#endif
+}
+
 // Packed word -> four bf16x2 A registers (E2M1 value * 2^-126). Layout in _word_sources().
 __device__ __forceinline__ void deq(uint32_t w, uint32_t r[4]) {
   const uint32_t M = 0x81C081C0u;
@@ -367,7 +446,9 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
                 const int* __restrict__ block_experts, const int* __restrict__ n_padded,
                 __nv_bfloat16* __restrict__ OUT, int numel, int snumel, int mode) {
   constexpr int S = SV % 100;              // pipeline stages
-  constexpr int SF = SV / 100;             // scale format: 0 code byte, 1 bf16, 2 bf16x2
+  constexpr int SF = (SV / 100) % 10;      // scale format: 0 code byte, 1 bf16, 2 bf16x2
+  constexpr int WGM = SV / 1000;           // 0: mma.sync; 1: wgmma (v35)
+  static_assert(WGM == 0 || NW % 4 == 0, "wgmma variants need whole warpgroups");
   constexpr int MATB = 512 + (64 << SF);   // bytes per matrix per 16-row unit per K tile
   constexpr int T = G * 8;
   constexpr int MATS = 2;
@@ -389,7 +470,6 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
   const int blk = (int)blockIdx.y;
   // mode bit 16 (inroute): sorted_ids is topk_ids (local_start 0); this CTA derives its block's expert,
   // the padded total and (below) its slots itself, deterministically, instead of reading the router's output.
-  // SPEEDUP (v31): routing computed inside each CTA; no separate router kernel or launch.
   const bool inroute = (mode & 16) != 0;
   __shared__ int r_cnt[32];
   __shared__ int r_info[3];  // expert, first occurrence index j0, padded total
@@ -454,7 +534,6 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
   }
   __syncthreads();
   if (inroute) {
-    // SPEEDUP (v31): pick this block's token slots in index order with ballots + a block scan.
     // slots = the j0 .. j0+T-1-th occurrences of `expert` in topk_ids, in index order
     __shared__ int r_w[32];
     if (tid < T) slots[tid] = -1;
@@ -518,7 +597,9 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
     const int off = (i < NCH) ? tokoff[tok] : -1;
     aval[j] = off >= 0;
     asrc[j] = X + (aval[j] ? off : 0) + k2 * 64 + c * 8;
-    adst[j] = sbase_u32 + (unsigned)(k2 * SUB + SUB_W + tok * (ACT_LD * 2) + c * 16);
+    adst[j] = sbase_u32 + (unsigned)(k2 * SUB + SUB_W +
+                                     (WGM ? (((tok >> 3) * 8 + c) * 128 + (tok & 7) * 16)  // core-matrix layout
+                                          : (tok * (ACT_LD * 2) + c * 16)));
   }
 
   auto issue_w = [&](int kto, int st) {
@@ -561,7 +642,6 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
         int spins = 0;
         while (ld_acquire_gpu(done) < 256 && ++spins < (1 << 16)) __nanosleep(32);
         if (spins >= (1 << 16)) pdl_wait();
-        // SPEEDUP (v31): the block's last GEMM2 CTA re-arms the counters, since no router zeroes them now.
         if (inroute) {  // persistent counters: the block's last GEMM2 CTA re-arms both for the next call
           int* d1 = const_cast<int*>(n_padded) + 1 + blk;
           int* d2 = d1 + 2048;
@@ -596,6 +676,7 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
   for (int kt = 0; kt < KTO; ++kt) {
     cp_wait<S - 2>();
     mbar_wait(&bars[st], par);
+    if constexpr (WGM != 0) fence_proxy_async();  // cp.async writes -> visible to the tensor core's async proxy
     __syncthreads();
     {
       if (kt + S - 1 < KTO) issue(kt + S - 1, ist);
@@ -659,7 +740,51 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
       }
     }
     const __nv_bfloat16* ab = reinterpret_cast<const __nv_bfloat16*>(sbase + SUB_W);
-    if constexpr (G >= 4) {
+    // EXPERIMENT (v35): wgmma path for big tiles. Never selected by the gate (no speedup); kept for reference.
+    if constexpr (WGM != 0) {
+      // Warp w of a warpgroup holds the 16 rows of its unit (mma.m16n8k16 A layout); one wgmma.m64nTk16 per
+      // matrix per K atom reads this K slice's whole token tile from shared memory once for all 4 warps.
+      uint32_t ag[4][MATS][4];
+#pragma unroll
+      for (int s = 0; s < 4; ++s)
+#pragma unroll
+        for (int m = 0; m < MATS; ++m) {
+          uint32_t r[4];
+          deq(wv[m][s], r);
+          ag[s][m][0] = hmul2_sc<SF>(r[0], sc[m][0][s], s);
+          ag[s][m][1] = hmul2_sc<SF>(r[1], sc[m][1][s], s);
+          ag[s][m][2] = hmul2_sc<SF>(r[2], sc[m][0][s], s);
+          ag[s][m][3] = hmul2_sc<SF>(r[3], sc[m][1][s], s);
+        }
+      const unsigned bb = smem_u32(ab);
+#pragma unroll
+      for (int m = 0; m < MATS; ++m)
+#pragma unroll
+        for (int g = 0; g < G; ++g)
+#pragma unroll
+          for (int i = 0; i < 4; ++i) keep_f(acc[m][g][i]);
+      wg_fence();
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        const uint64_t desc = wg_desc(bb + s * 256, 128, 1024);  // LBO: K-adjacent core matrices, SBO: 8-token groups
+#pragma unroll
+        for (int m = 0; m < MATS; ++m) wgmma_rs<G>(&acc[m][0][0], ag[s][m], desc);
+      }
+      wg_commit();
+      wg_wait0();
+#pragma unroll
+      for (int s = 0; s < 4; ++s)
+#pragma unroll
+        for (int m = 0; m < MATS; ++m)
+#pragma unroll
+          for (int i = 0; i < 4; ++i) keep_r(ag[s][m][i]);
+#pragma unroll
+      for (int m = 0; m < MATS; ++m)
+#pragma unroll
+        for (int g = 0; g < G; ++g)
+#pragma unroll
+          for (int i = 0; i < 4; ++i) keep_f(acc[m][g][i]);
+    } else if constexpr (G >= 4) {
       // Large token tiles: load each atom's B fragments just before use (2 live regs per group).
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
@@ -778,7 +903,7 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
 template <int KIND, int NW, int G, int S, int KS>
 struct Cfg {
   static constexpr size_t smem =
-      (size_t)(S % 100) * KS * (NW * 2 * (512 + (64 << (S / 100))) + G * 8 * ACT_LD * 2) + (size_t)G * 8 * 8 + 128;
+      (size_t)(S % 100) * KS * (NW * 2 * (512 + (64 << ((S / 100) % 10))) + G * 8 * ACT_LD * 2) + (size_t)G * 8 * 8 + 128;
 };
 
 // Launch with or without programmatic stream serialization (PDL).
@@ -1009,9 +1134,15 @@ for _b, _vs in {16: [(4, 2, 3, 2)], 32: [(4, 4, 3, 2)]}.items():
     G2_VARIANTS[_b] = list(G2_VARIANTS[_b]) + _vs
 
 
+# v35: wgmma variants (appended; earlier indices unchanged)
+for _b, _vs in {16: [(4, 2, 1103, 2), (4, 2, 1003, 2)], 32: [(4, 4, 1103, 2), (4, 4, 1003, 2), (8, 4, 1004, 1)], 48: [(4, 6, 1103, 2), (4, 6, 1003, 2), (8, 6, 1003, 1)], 64: [(4, 8, 1103, 2), (4, 8, 1003, 2), (8, 8, 1004, 1), (8, 8, 1103, 1)]}.items():
+    G1_VARIANTS[_b] = list(G1_VARIANTS[_b]) + _vs
+    G2_VARIANTS[_b] = list(G2_VARIANTS[_b]) + _vs
+
+
 def _sf(cfg):
     """Scale format of a variant: the hundreds digit of its stage field."""
-    return cfg[2] // 100
+    return (cfg[2] // 100) % 10
 
 
 _ARGS_DECL = ("const void* x, const void* w, const void* gs, const void* sorted_ids, const void* bexp, "
@@ -1186,7 +1317,7 @@ def _build_extension():
 
     from torch.utils.cpp_extension import load
 
-    root = tempfile.mkdtemp(prefix="muse_v31_")
+    root = tempfile.mkdtemp(prefix="muse_v35_")
     sources = []
     cpp = os.path.join(root, "muse_ext.cpp")
     with open(cpp, "w") as f:
@@ -1204,10 +1335,10 @@ def _build_extension():
             sources.append(path)
     os.environ.setdefault("MAX_JOBS", str(max(4, min(16, os.cpu_count() or 4))))
     return load(
-        name="muse_v31_ext",
+        name="muse_v35_ext",
         sources=sources,
         extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a"],  # wgmma needs sm_90a
         build_directory=root,
         with_cuda=True,
         verbose=False,
@@ -1254,15 +1385,18 @@ def _compile_new_kernels(weights):
         live_max = min(32, numel)  # experts that can hold tokens
         nblocks = (numel + live_max * (bsm - 1) + bsm - 1) // bsm
         dev = x.device
-        if (pdl_box[0] & 16) and "ctr" in state_ref[0]:
+        # CORRECTNESS (v32): in-kernel routing only with the custom norm (SGLang's norm misreads global ids).
+        if (pdl_box[0] & 16) and norm and "ctr" in state_ref[0]:  # v32: custom norm only
             # v31: the GEMMs route in-kernel from topk_ids; counters in the persistent buffer
             assert nblocks <= 2048
+            inroute = True
             ctr = state_ref[0]["ctr"]
             local_ids = ids
             sorted_ids = ids.view(-1)
             bexp = ctr[1:1 + nblocks]  # sets the grid height only; not read in-kernel
             npad = ctr
         else:
+            inroute = False
             local_ids = torch.empty((m, TOP_K), dtype=torch.int32, device=dev)
             sorted_ids = torch.empty((nblocks * bsm,), dtype=torch.int32, device=dev)
             bexp = torch.empty((nblocks,), dtype=torch.int32, device=dev)
@@ -1271,11 +1405,10 @@ def _compile_new_kernels(weights):
         cache2 = torch.empty((numel, 4096), dtype=x.dtype, device=dev)
         v1 = min(v1, len(G1_VARIANTS[bsm]) - 1)
         v2 = min(v2, len(G2_VARIANTS[bsm]) - 1)
-        mod.launch(1, x, p13[_sf(G1_VARIANTS[bsm][v1])], gs13, sorted_ids, bexp, npad, cache2, bsm, v1,
-                   mode_box[0] | pdl_box[0])
+        md = (mode_box[0] | pdl_box[0]) if inroute else ((mode_box[0] | pdl_box[0]) & ~16)
+        mod.launch(1, x, p13[_sf(G1_VARIANTS[bsm][v1])], gs13, sorted_ids, bexp, npad, cache2, bsm, v1, md)
         y = torch.empty((numel, 4096), dtype=x.dtype, device=dev)
-        mod.launch(2, cache2, p2[_sf(G2_VARIANTS[bsm][v2])], gs2, sorted_ids, bexp, npad, y, bsm, v2,
-                   mode_box[0] | pdl_box[0])
+        mod.launch(2, cache2, p2[_sf(G2_VARIANTS[bsm][v2])], gs2, sorted_ids, bexp, npad, y, bsm, v2, md)
         y = y.view(m, TOP_K, 4096)
         if norm:
             out = torch.empty((m, 4096), dtype=x.dtype, device=dev)
@@ -1621,7 +1754,7 @@ def _gate_shapes(state, device) -> None:
                 if ok and us < best[3]:
                     best = (best[0], best[1], best[2], us)
                     pdl_on = 268
-            if pdl_on and full and state.get("inroute_ok") and best[1] is not None:
+            if pdl_on and full and best[2] and state.get("inroute_ok") and best[1] is not None:
                 pbox[0] = pdl_on | 16
                 ok, us = _try(name, f"INROUTE pdl={pdl_on | 16} g1={best[0]} g2={best[1]} norm={best[2]} bsm={tile}",
                               lambda d, s, c=cfg5: new_fn(d, s, v1=c[0], v2=c[1], norm=c[2], full=c[3], bsm=c[4]),
