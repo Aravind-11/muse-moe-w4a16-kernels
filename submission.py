@@ -1,12 +1,12 @@
 # okc: problem=muse_moe_w4a16
 # ==================================================================================================
-# v16 — activation-gather addresses hoisted out of the K loop
-# Judged score: 1.5532× (`2a8a1508d44f46d4`; second run 1.5585×)   (previous best: 1.4018× (v15))
-# Built on: v15
+# v21 — scales pre-converted (memoized) in prepare()
+# Judged score: 1.6253× (`27dd3086169e4155`)   (previous best: 1.5532× (v16))
+# Built on: v16
 #
 # What this version does and why it is faster: see README.md in this folder.
 # Every line that produced this version's speedup is marked with a comment starting
-# 'SPEEDUP (v16)' (search for it). Those comments are the only change from the judged file;
+# 'SPEEDUP (v21)' (search for it). Those comments are the only change from the judged file;
 # no code was altered.
 # ==================================================================================================
 """NVFP4 routed experts on H200.
@@ -207,7 +207,7 @@ def _scale_code_lut():
     return lut
 
 
-def _pack_expert(w_e, sfc_e, ix, stack, cat):
+def _pack_expert(w_e, sfc_e, ix, stack, cat, fmt=0):
     """w_e uint8 [rows, K/2] (low nibble = even k), sfc_e coded scales [rows, K/16] -> flat pieces."""
     g = [(w_e[ix["n"][i], ix["kb"][i]] >> ix["sh"][i]) & 15 for i in range(8)]
     # A zero block scale makes the block exactly zero in the reference; zero its codes too.
@@ -221,6 +221,13 @@ def _pack_expert(w_e, sfc_e, ix, stack, cat):
     kt_n, nt_n, mats = words.shape[0], words.shape[1], words.shape[2]
     words = words.reshape(kt_n, nt_n, mats, 512)
     sc = sfc_e[ix["sn"], ix["sk"]].reshape(kt_n, nt_n, mats, 64)
+    if fmt:
+        # SPEEDUP (v21): convert the scales once at setup: exactly what the kernel's scale_dup computed.
+        # Memoized scale conversion: the exact bf16 bits the kernel's scale_dup produces, (code << 4) + 0x5880,
+        # stored as bf16 (fmt 1) or as the duplicated bf16x2 word (fmt 2), little-endian.
+        h = (sc.to(torch.int32) << 4) + 0x5880
+        h = h.to(torch.int16) if fmt == 1 else (h | (h << 16)).to(torch.int32)
+        sc = h.contiguous().view(torch.uint8).reshape(kt_n, nt_n, mats, -1)
     return cat([words, sc]).reshape(-1)
 # ---PACK-END---
 
@@ -317,17 +324,20 @@ __device__ __forceinline__ uint32_t scale_dup(uint32_t u, int s) {
 //            activation row = token; 256 units.
 // KIND == 2: GEMM2. A unit is 16 rows of W2 + the same 16 rows offset by 2048 (same per-tile work as
 //            GEMM1); epilogue plain bf16; activation row = slot (cache2); 128 units.
-template <int KIND, int NW, int G, int S, int KS>
+template <int KIND, int NW, int G, int SV, int KS>
 __global__ void __launch_bounds__(NW * KS * 32)
 moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__ W,
                 const float* __restrict__ GS, const int* __restrict__ sorted_ids,
                 const int* __restrict__ block_experts, const int* __restrict__ n_padded,
                 __nv_bfloat16* __restrict__ OUT, int numel, int snumel, int mode) {
+  constexpr int S = SV % 100;              // pipeline stages
+  constexpr int SF = SV / 100;             // scale format: 0 code byte, 1 bf16, 2 bf16x2
+  constexpr int MATB = 512 + (64 << SF);   // bytes per matrix per 16-row unit per K tile
   constexpr int T = G * 8;
   constexpr int MATS = 2;
   constexpr int NTU = KIND == 1 ? 256 : 128;
   constexpr int NTH = NW * KS * 32;
-  constexpr int PIECE = MATS * 576;
+  constexpr int PIECE = MATS * MATB;
   constexpr int SUB_W = NW * PIECE;          // one K tile of this CTA's NW 16-row units
   constexpr int SUB = SUB_W + T * ACT_LD * 2;
   constexpr int STAGE = KS * SUB;            // KS consecutive K tiles per stage
@@ -377,7 +387,6 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
   const int nchunk = (int)blockIdx.x;
   const uint8_t* wsrc = W + ((size_t)expert * KT * NTU + (size_t)nchunk * NW) * PIECE;
 
-  // SPEEDUP (v16): copy addresses are computed once here instead of on every K tile.
   // Activation gather plan, fixed for the whole K loop: chunk i = tid + j*NTH is token tok's 16-byte
   // piece c of K sub-tile k2. Per tile only the K offset (and the stage) changes.
   constexpr int NCH = KS * T * 8;
@@ -410,7 +419,6 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
     }
 #pragma unroll
     for (int j = 0; j < CPT; ++j) {
-      // SPEEDUP (v16): per tile only the K and stage offsets are added.
       if (aval[j]) cp16a(adst[j] + (unsigned)(st * STAGE), asrc[j] + kto * (KS * 64));
     }
   };
@@ -447,16 +455,42 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
     uint32_t sc[MATS][2][4];
 #pragma unroll
     for (int m = 0; m < MATS; ++m) {
-      const uint4 w4 = *reinterpret_cast<const uint4*>(pw + m * 576 + lane * 16);
+      const uint4 w4 = *reinterpret_cast<const uint4*>(pw + m * MATB + lane * 16);
       wv[m][0] = w4.x;
       wv[m][1] = w4.y;
       wv[m][2] = w4.z;
       wv[m][3] = w4.w;
-      const uint2 u = *reinterpret_cast<const uint2*>(pw + m * 576 + 512 + grp * 8);
+      if constexpr (SF == 0) {
+        const uint2 u = *reinterpret_cast<const uint2*>(pw + m * MATB + 512 + grp * 8);
 #pragma unroll
-      for (int s = 0; s < 4; ++s) {
-        sc[m][0][s] = scale_dup(u.x, s);
-        sc[m][1][s] = scale_dup(u.y, s);
+        for (int s = 0; s < 4; ++s) {
+          sc[m][0][s] = scale_dup(u.x, s);
+          sc[m][1][s] = scale_dup(u.y, s);
+        }
+      // SPEEDUP (v21): bf16 scales come pre-converted; only a byte_perm to duplicate the half remains.
+      } else if constexpr (SF == 1) {
+        // bf16 per scale: rows grp / grp+8, atoms 0..3, two per word -> duplicate the half.
+        const uint4 v = *reinterpret_cast<const uint4*>(pw + m * MATB + 512 + grp * 16);
+        sc[m][0][0] = __byte_perm(v.x, 0u, 0x1010u);
+        sc[m][0][1] = __byte_perm(v.x, 0u, 0x3232u);
+        sc[m][0][2] = __byte_perm(v.y, 0u, 0x1010u);
+        sc[m][0][3] = __byte_perm(v.y, 0u, 0x3232u);
+        sc[m][1][0] = __byte_perm(v.z, 0u, 0x1010u);
+        sc[m][1][1] = __byte_perm(v.z, 0u, 0x3232u);
+        sc[m][1][2] = __byte_perm(v.w, 0u, 0x1010u);
+        sc[m][1][3] = __byte_perm(v.w, 0u, 0x3232u);
+      } else {
+        // bf16x2 per scale, already duplicated: load and use.
+        const uint4 a = *reinterpret_cast<const uint4*>(pw + m * MATB + 512 + grp * 32);
+        const uint4 b = *reinterpret_cast<const uint4*>(pw + m * MATB + 512 + grp * 32 + 16);
+        sc[m][0][0] = a.x;
+        sc[m][0][1] = a.y;
+        sc[m][0][2] = a.z;
+        sc[m][0][3] = a.w;
+        sc[m][1][0] = b.x;
+        sc[m][1][1] = b.y;
+        sc[m][1][2] = b.z;
+        sc[m][1][3] = b.w;
       }
     }
     const __nv_bfloat16* ab = reinterpret_cast<const __nv_bfloat16*>(sbase + SUB_W);
@@ -571,7 +605,7 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
 template <int KIND, int NW, int G, int S, int KS>
 struct Cfg {
   static constexpr size_t smem =
-      (size_t)S * KS * (NW * 2 * 576 + G * 8 * ACT_LD * 2) + (size_t)G * 8 * 8 + 128;
+      (size_t)(S % 100) * KS * (NW * 2 * (512 + (64 << (S / 100))) + G * 8 * ACT_LD * 2) + (size_t)G * 8 * 8 + 128;
 };
 
 template <int KIND, int NW, int G, int S, int KS>
@@ -751,16 +785,27 @@ route_kernel(const int* __restrict__ ids, int numel, int local_start, int bsm, i
 # (warps per CTA, token groups of 8 = bsm/8, cp.async/TMA stages) per variant. Source of truth for
 # both the generated CUDA dispatchers and the Python gate.
 # (warps per K slice, token groups of 8 = bsm/8, stages, K slices per CTA)
-G1_VARIANTS = {8: [(4, 1, 6, 1), (2, 1, 8, 1), (2, 1, 4, 4), (4, 1, 4, 2)],
-               16: [(4, 2, 6, 1), (2, 2, 8, 1), (2, 2, 4, 4), (4, 2, 4, 2)],
-               32: [(8, 4, 5, 1), (4, 4, 6, 1), (4, 4, 4, 2)],
+G1_VARIANTS = {8: [(4, 1, 6, 1), (2, 1, 8, 1), (2, 1, 4, 4), (4, 1, 4, 2),
+                   (2, 1, 104, 4), (2, 1, 204, 4), (4, 1, 104, 2), (4, 1, 204, 2)],
+               16: [(4, 2, 6, 1), (2, 2, 8, 1), (2, 2, 4, 4), (4, 2, 4, 2),
+                    (4, 2, 104, 2), (4, 2, 204, 2), (4, 2, 103, 2), (4, 2, 203, 2)],
+               32: [(8, 4, 5, 1), (4, 4, 6, 1), (4, 4, 4, 2),
+                    (4, 4, 104, 2), (4, 4, 204, 2), (4, 4, 103, 2), (4, 4, 203, 2)],
                48: [(8, 6, 4, 1), (4, 6, 4, 2)],
                64: [(8, 8, 4, 1), (4, 8, 5, 1), (4, 8, 3, 2)]}
-G2_VARIANTS = {8: [(4, 1, 6, 1), (2, 1, 8, 1), (2, 1, 4, 4), (4, 1, 4, 2)],
-               16: [(4, 2, 6, 1), (2, 2, 8, 1), (2, 2, 4, 4), (4, 2, 4, 2)],
-               32: [(8, 4, 5, 1), (4, 4, 6, 1), (4, 4, 4, 2)],
+G2_VARIANTS = {8: [(4, 1, 6, 1), (2, 1, 8, 1), (2, 1, 4, 4), (4, 1, 4, 2),
+                   (2, 1, 104, 4), (2, 1, 204, 4), (4, 1, 104, 2), (4, 1, 204, 2)],
+               16: [(4, 2, 6, 1), (2, 2, 8, 1), (2, 2, 4, 4), (4, 2, 4, 2),
+                    (4, 2, 104, 2), (4, 2, 204, 2), (4, 2, 103, 2), (4, 2, 203, 2)],
+               32: [(8, 4, 5, 1), (4, 4, 6, 1), (4, 4, 4, 2),
+                    (4, 4, 104, 2), (4, 4, 204, 2), (4, 4, 103, 2), (4, 4, 203, 2)],
                48: [(8, 6, 4, 1), (4, 6, 4, 2)],
                64: [(8, 8, 4, 1), (4, 8, 5, 1), (4, 8, 3, 2)]}
+def _sf(cfg):
+    """Scale format of a variant: the hundreds digit of its stage field."""
+    return cfg[2] // 100
+
+
 _ARGS_DECL = ("const void* x, const void* w, const void* gs, const void* sorted_ids, const void* bexp, "
               "const void* npad, void* out, int numel, int snumel, int nblocks, int mode, cudaStream_t stream")
 _ARGS_PASS = "x, w, gs, sorted_ids, bexp, npad, out, numel, snumel, nblocks, mode, stream"
@@ -856,7 +901,8 @@ void launch(int64_t kind, torch::Tensor x, torch::Tensor w, torch::Tensor gs, to
   TORCH_CHECK(npad.is_cuda() && npad.scalar_type() == torch::kInt32 && npad.numel() >= 1, "n_padded");
   TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == torch::kBFloat16 && out.size(1) == 4096, "out");
   const int64_t pieces = (int64_t)32 * 64 * (kind == 1 ? 256 : 128);
-  TORCH_CHECK(w.numel() == pieces * 1152, "w bytes");
+  TORCH_CHECK(w.numel() == pieces * 1152 || w.numel() == pieces * 1280 || w.numel() == pieces * 1536,
+              "w bytes");
   const int64_t numel64 = kind == 1 ? x.size(0) * 8 : x.size(0);
   TORCH_CHECK(out.size(0) == numel64, "out rows");
   const int numel = static_cast<int>(numel64);
@@ -892,7 +938,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 '''
 
 
-def _repack(w, sf, mats, half_rows):
+def _repack(w, sf, mats, half_rows, fmt=0):
     """Repack 32 local experts into the kernel's kt-major fragment layout. Same byte count as the input."""
     rows = w.shape[1]
     nt_n = rows // (16 * mats)
@@ -910,12 +956,13 @@ def _repack(w, sf, mats, half_rows):
     del ix_np
     lut = torch.from_numpy(_scale_code_lut()).to(dev)
     sf_u8 = sf.contiguous().view(torch.uint8)
-    out = torch.empty((32, 64 * nt_n * mats * 576), dtype=torch.uint8, device=dev)
+    out = torch.empty((32, 64 * nt_n * mats * (512 + (64 << fmt))), dtype=torch.uint8, device=dev)
     for e in range(32):
         out[e] = _pack_expert(
             w[e].contiguous(), lut[sf_u8[e].long()], ix,
             lambda lst: torch.stack(lst, dim=-1),
             lambda lst: torch.cat(lst, dim=-1),
+            fmt,
         )
     del ix
     torch.cuda.empty_cache()
@@ -929,7 +976,7 @@ def _build_extension():
 
     from torch.utils.cpp_extension import load
 
-    root = tempfile.mkdtemp(prefix="muse_v16_")
+    root = tempfile.mkdtemp(prefix="muse_v21_")
     sources = []
     cpp = os.path.join(root, "muse_ext.cpp")
     with open(cpp, "w") as f:
@@ -947,7 +994,7 @@ def _build_extension():
             sources.append(path)
     os.environ.setdefault("MAX_JOBS", str(max(4, min(16, os.cpu_count() or 4))))
     return load(
-        name="muse_v16_ext",
+        name="muse_v21_ext",
         sources=sources,
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
@@ -963,9 +1010,11 @@ def _compile_new_kernels(weights):
     w2 = weights["w2"][:32]
     gs13 = weights["w13_gs"][:32].contiguous().float()
     gs2 = weights["w2_gs"][:32].contiguous().float()
-    p13 = _repack(w13, weights["w13_sf"][:32], 2, 4096)
-    p2 = _repack(w2, weights["w2_sf"][:32], 2, 2048)   # rows r and r + 2048 share a unit
-    print(f"REPACK w13={p13.nbytes} w2={p2.nbytes} elapsed_s={_elapsed():.1f}", flush=True)
+    # One pack per scale format (0 code byte, 1 bf16, 2 bf16x2); a variant's stage digit picks it.
+    p13 = {f: _repack(w13, weights["w13_sf"][:32], 2, 4096, f) for f in (0, 1, 2)}
+    p2 = {f: _repack(w2, weights["w2_sf"][:32], 2, 2048, f) for f in (0, 1, 2)}   # rows r, r + 2048 share a unit
+    print(f"REPACK w13={[p.nbytes for p in p13.values()]} w2={[p.nbytes for p in p2.values()]} "
+          f"elapsed_s={_elapsed():.1f}", flush=True)
     mod = _build_extension()
     print(f"BUILD_OK elapsed_s={_elapsed():.1f}", flush=True)
     for kind, table in ((1, G1_VARIANTS), (2, G2_VARIANTS)):
@@ -991,7 +1040,8 @@ def _compile_new_kernels(weights):
         m = x.shape[0]
         numel = m * TOP_K
         bsm = bsm_force if bsm_force else _bsm_for(m)
-        nblocks = (numel + 32 * (bsm - 1) + bsm - 1) // bsm
+        live_max = min(32, numel)  # experts that can hold tokens
+        nblocks = (numel + live_max * (bsm - 1) + bsm - 1) // bsm
         dev = x.device
         local_ids = torch.empty((m, TOP_K), dtype=torch.int32, device=dev)
         sorted_ids = torch.empty((nblocks * bsm,), dtype=torch.int32, device=dev)
@@ -999,10 +1049,12 @@ def _compile_new_kernels(weights):
         npad = torch.empty((1,), dtype=torch.int32, device=dev)
         mod.route(ids, local_ids, sorted_ids, bexp, npad, data["config"]["local_start"], bsm)
         cache2 = torch.empty((numel, 4096), dtype=x.dtype, device=dev)
-        mod.launch(1, x, p13, gs13, sorted_ids, bexp, npad, cache2, bsm, min(v1, len(G1_VARIANTS[bsm]) - 1),
+        v1 = min(v1, len(G1_VARIANTS[bsm]) - 1)
+        v2 = min(v2, len(G2_VARIANTS[bsm]) - 1)
+        mod.launch(1, x, p13[_sf(G1_VARIANTS[bsm][v1])], gs13, sorted_ids, bexp, npad, cache2, bsm, v1,
                    mode_box[0])
         y = torch.empty((numel, 4096), dtype=x.dtype, device=dev)
-        mod.launch(2, cache2, p2, gs2, sorted_ids, bexp, npad, y, bsm, min(v2, len(G2_VARIANTS[bsm]) - 1),
+        mod.launch(2, cache2, p2[_sf(G2_VARIANTS[bsm][v2])], gs2, sorted_ids, bexp, npad, y, bsm, v2,
                    mode_box[0])
         y = y.view(m, TOP_K, 4096)
         if norm:
@@ -1033,12 +1085,14 @@ def _compile_new_kernels(weights):
         g1 = g2 = None
         if v1 is not None:
             def g1(x, sorted_ids, block_experts, n_padded, out, bsm):
-                mod.launch(1, x, p13, gs13, sorted_ids, block_experts, n_padded, out, bsm,
-                           min(v1, len(G1_VARIANTS[bsm]) - 1), mode_box[0])
+                vv = min(v1, len(G1_VARIANTS[bsm]) - 1)
+                mod.launch(1, x, p13[_sf(G1_VARIANTS[bsm][vv])], gs13, sorted_ids, block_experts, n_padded, out, bsm,
+                           vv, mode_box[0])
         if v2 is not None:
             def g2(x, sorted_ids, block_experts, n_padded, out, bsm):
-                mod.launch(2, x, p2, gs2, sorted_ids, block_experts, n_padded, out, bsm,
-                           min(v2, len(G2_VARIANTS[bsm]) - 1), mode_box[0])
+                vv = min(v2, len(G2_VARIANTS[bsm]) - 1)
+                mod.launch(2, x, p2[_sf(G2_VARIANTS[bsm][vv])], gs2, sorted_ids, block_experts, n_padded, out, bsm,
+                           vv, mode_box[0])
         return _marlin_forward(data, state, gemm1=g1, gemm2=g2, norm=_norm if norm else None)
 
     return _forward, mode_box
@@ -1273,8 +1327,23 @@ def _gate_shapes(state, device) -> None:
             if _elapsed() > PREPARE_SOFT_LIMIT_S:
                 print(f"TILE_SKIP shape={name} bsm={tb} prepare_elapsed_s={_elapsed():.1f}", flush=True)
                 break
-            for tv1 in range(len(G1_VARIANTS[tb])):
-                for tv2 in range(len(G2_VARIANTS[tb])):
+            n1, n2 = len(G1_VARIANTS[tb]), len(G2_VARIANTS[tb])
+            first = None
+            for tv1 in range(n1):
+                tv2 = min(tv1, n2 - 1)
+                ok, us = _try(name, f"TILE bsm={tb} g1={tv1} g2={tv2} norm=True",
+                              lambda d, s, a=tv1, b=tv2, t=tb: new_fn(d, s, v1=a, v2=b, norm=True, full=True, bsm=t),
+                              data, state, ref, mode_box)
+                if ok and (first is None or us < first[1]):
+                    first = (tv1, us)
+                if ok and us < best[3]:
+                    best = (tv1, tv2, True, us)
+                    full, tile = True, tb
+            if first is not None:
+                for tv2 in range(n2):
+                    if tv2 == min(first[0], n2 - 1) or _elapsed() > PREPARE_SOFT_LIMIT_S:
+                        continue
+                    tv1 = first[0]
                     ok, us = _try(name, f"TILE bsm={tb} g1={tv1} g2={tv2} norm=True",
                                   lambda d, s, a=tv1, b=tv2, t=tb: new_fn(d, s, v1=a, v2=b, norm=True, full=True, bsm=t),
                                   data, state, ref, mode_box)
