@@ -1,12 +1,12 @@
 # okc: problem=muse_moe_w4a16
 # ==================================================================================================
-# v28 — two scales per register for 1-byte scales
-# Judged score: 1.8458× scored (`196ad392b4524623`)   (previous best: 1.8042× (v27))
-# Built on: v27
+# v31 — routing folded into the GEMM CTAs (decode-1)
+# Judged score: 1.8541× scored (`cfd709c24f694754`)   (previous best: 1.8458× (v28))
+# Built on: v28
 #
 # What this version does and why it is faster: see README.md in this folder.
 # Every line that produced this version's speedup is marked with a comment starting
-# 'SPEEDUP (v28)' (search for it). Those comments are the only change from the judged file;
+# 'SPEEDUP (v31)' (search for it). Those comments are the only change from the judged file;
 # no code was altered.
 # ==================================================================================================
 """NVFP4 routed experts on H200.
@@ -346,7 +346,6 @@ __device__ __forceinline__ uint32_t hmul2_hi(uint32_t a, uint32_t b) {
 template <int SF>
 __device__ __forceinline__ uint32_t hmul2_sc(uint32_t a, uint32_t b, int s) {
   if constexpr (SF == 1) return (s & 1) ? hmul2_hi(a, b) : hmul2_lo(a, b);
-  // SPEEDUP (v28): for 1-byte scales, atoms 0/1 use the low half, atoms 2/3 the high half.
   else if constexpr (SF == 0) return (s & 2) ? hmul2_hi(a, b) : hmul2_lo(a, b);  // x02 / x13 pairs
   else return hmul2(a, b);
 }
@@ -388,8 +387,48 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
   if (KIND == 1 || !early) pdl_wait();  // inputs come from the previous kernel (PDL launch); no-op on a plain launch
   if (KIND == 1 && early) pdl_trigger();
   const int blk = (int)blockIdx.y;
-  if (blk * T >= *n_padded) return;
-  const int expert = block_experts[blk];
+  // mode bit 16 (inroute): sorted_ids is topk_ids (local_start 0); this CTA derives its block's expert,
+  // the padded total and (below) its slots itself, deterministically, instead of reading the router's output.
+  // SPEEDUP (v31): routing computed inside each CTA; no separate router kernel or launch.
+  const bool inroute = (mode & 16) != 0;
+  __shared__ int r_cnt[32];
+  __shared__ int r_info[3];  // expert, first occurrence index j0, padded total
+  int expert, j0 = 0, npad_v;
+  if (inroute) {
+    const int t0 = (int)threadIdx.x;
+    if (t0 < 32) r_cnt[t0] = 0;
+    __syncthreads();
+    for (int base = 0; base < numel; base += NTH) {  // uniform trip count: all lanes reach the match
+      const int i = base + t0;
+      const int e = i < numel ? sorted_ids[i] : -1;
+      const unsigned peers = __match_any_sync(0xffffffffu, e);
+      if ((unsigned)e < 32u && (t0 & 31) == __ffs(peers) - 1) atomicAdd(&r_cnt[e], __popc(peers));
+    }
+    __syncthreads();
+    if (t0 == 0) {
+      int off = 0, eh = -1, jj = 0;
+      const int pos = blk * T;
+      for (int k = 0; k < 32; ++k) {
+        const int nx = off + ((r_cnt[k] + T - 1) / T) * T;
+        if (pos >= off && pos < nx) {
+          eh = k;
+          jj = pos - off;
+        }
+        off = nx;
+      }
+      r_info[0] = eh;
+      r_info[1] = jj;
+      r_info[2] = off;
+    }
+    __syncthreads();
+    expert = r_info[0];
+    j0 = r_info[1];
+    npad_v = r_info[2];
+  } else {
+    npad_v = *n_padded;
+    expert = blk * T < npad_v ? block_experts[blk] : -1;
+  }
+  if (blk * T >= npad_v) return;
   if (expert < 0) return;
 
   extern __shared__ __align__(128) unsigned char dyn[];
@@ -414,13 +453,45 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
     mbar_fence_init();
   }
   __syncthreads();
-  if (tid < T) {
-    const int ii = blk * T + tid;
-    const int slot = ii < snumel ? sorted_ids[ii] : numel;
-    const bool valid = slot < numel;
-    slots[tid] = valid ? slot : -1;
-    tokoff[tid] = valid ? (KIND == 1 ? (slot >> 3) : slot) * KDIM : -1;
-    if (valid) atomicMax(&nact_s, tid + 1);
+  if (inroute) {
+    // SPEEDUP (v31): pick this block's token slots in index order with ballots + a block scan.
+    // slots = the j0 .. j0+T-1-th occurrences of `expert` in topk_ids, in index order
+    __shared__ int r_w[32];
+    if (tid < T) slots[tid] = -1;
+    __syncthreads();
+    int run = 0;
+    for (int base = 0; base < numel && run < j0 + T; base += NTH) {  // run is CTA-uniform
+      const int i = base + tid;
+      const bool hit = i < numel && sorted_ids[i] == expert;
+      const unsigned bal = __ballot_sync(0xffffffffu, hit);
+      if (lane == 0) r_w[warp] = __popc(bal);
+      __syncthreads();
+      int woff = 0, tot = 0;
+#pragma unroll 1
+      for (int w = 0; w < NTH / 32; ++w) {
+        const int c = r_w[w];
+        woff += w < warp ? c : 0;
+        tot += c;
+      }
+      const int rank = run + woff + __popc(bal & ((1u << lane) - 1u));
+      if (hit && rank >= j0 && rank < j0 + T) slots[rank - j0] = i;
+      run += tot;
+      __syncthreads();
+    }
+    if (tid < T) {
+      const int slot = slots[tid];
+      tokoff[tid] = slot >= 0 ? (KIND == 1 ? (slot >> 3) : slot) * KDIM : -1;
+      if (slot >= 0) atomicMax(&nact_s, tid + 1);
+    }
+  } else {
+    if (tid < T) {
+      const int ii = blk * T + tid;
+      const int slot = ii < snumel ? sorted_ids[ii] : numel;
+      const bool valid = slot < numel;
+      slots[tid] = valid ? slot : -1;
+      tokoff[tid] = valid ? (KIND == 1 ? (slot >> 3) : slot) * KDIM : -1;
+      if (valid) atomicMax(&nact_s, tid + 1);
+    }
   }
   __syncthreads();
   const int nact = nact_s;
@@ -490,6 +561,15 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
         int spins = 0;
         while (ld_acquire_gpu(done) < 256 && ++spins < (1 << 16)) __nanosleep(32);
         if (spins >= (1 << 16)) pdl_wait();
+        // SPEEDUP (v31): the block's last GEMM2 CTA re-arms the counters, since no router zeroes them now.
+        if (inroute) {  // persistent counters: the block's last GEMM2 CTA re-arms both for the next call
+          int* d1 = const_cast<int*>(n_padded) + 1 + blk;
+          int* d2 = d1 + 2048;
+          if (atomicAdd(d2, 1) == (int)gridDim.x - 1) {
+            *d1 = 0;
+            *d2 = 0;
+          }
+        }
       }
       __syncthreads();
     } else {
@@ -539,7 +619,6 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
       wv[m][3] = w4.w;
       if constexpr (SF == 0) {
         const uint2 u = *reinterpret_cast<const uint2*>(pw + m * MATB + 512 + grp * 8);
-        // SPEEDUP (v28): one word holds two scales; the multiply picks the half (4 ops per row word instead of 8).
         // two scales per word: atoms 0|2 and 1|3 (hmul2_sc<0> picks the half); == scale_dup per half
         const uint32_t r0_02 = (u.x & 0x00FF00FFu) * k16 + 0x58805880u;
         const uint32_t r0_13 = __byte_perm(u.x, 0u, 0x4341u) * k16 + 0x58805880u;
@@ -769,7 +848,10 @@ post_norm_kernel(const __nv_bfloat16* __restrict__ Y, const float* __restrict__ 
   float tw[8];
 #pragma unroll
   for (int k = 0; k < 8; ++k) {
-    lid[k] = LID[t * 8 + k];
+    {
+      const int r = LID[t * 8 + k];
+      lid[k] = (unsigned)r < 32u ? r : -1;  // topk_ids or local ids (local_start 0)
+    }
     tw[k] = TW[t * 8 + k];
   }
   uint4 raw[8][2];
@@ -1104,7 +1186,7 @@ def _build_extension():
 
     from torch.utils.cpp_extension import load
 
-    root = tempfile.mkdtemp(prefix="muse_v28_")
+    root = tempfile.mkdtemp(prefix="muse_v31_")
     sources = []
     cpp = os.path.join(root, "muse_ext.cpp")
     with open(cpp, "w") as f:
@@ -1122,7 +1204,7 @@ def _build_extension():
             sources.append(path)
     os.environ.setdefault("MAX_JOBS", str(max(4, min(16, os.cpu_count() or 4))))
     return load(
-        name="muse_v28_ext",
+        name="muse_v31_ext",
         sources=sources,
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
@@ -1172,11 +1254,20 @@ def _compile_new_kernels(weights):
         live_max = min(32, numel)  # experts that can hold tokens
         nblocks = (numel + live_max * (bsm - 1) + bsm - 1) // bsm
         dev = x.device
-        local_ids = torch.empty((m, TOP_K), dtype=torch.int32, device=dev)
-        sorted_ids = torch.empty((nblocks * bsm,), dtype=torch.int32, device=dev)
-        bexp = torch.empty((nblocks,), dtype=torch.int32, device=dev)
-        npad = torch.empty((1 + nblocks,), dtype=torch.int32, device=dev)  # [n_padded, block counters]
-        mod.route(ids, local_ids, sorted_ids, bexp, npad, data["config"]["local_start"], bsm)
+        if (pdl_box[0] & 16) and "ctr" in state_ref[0]:
+            # v31: the GEMMs route in-kernel from topk_ids; counters in the persistent buffer
+            assert nblocks <= 2048
+            ctr = state_ref[0]["ctr"]
+            local_ids = ids
+            sorted_ids = ids.view(-1)
+            bexp = ctr[1:1 + nblocks]  # sets the grid height only; not read in-kernel
+            npad = ctr
+        else:
+            local_ids = torch.empty((m, TOP_K), dtype=torch.int32, device=dev)
+            sorted_ids = torch.empty((nblocks * bsm,), dtype=torch.int32, device=dev)
+            bexp = torch.empty((nblocks,), dtype=torch.int32, device=dev)
+            npad = torch.empty((1 + nblocks,), dtype=torch.int32, device=dev)  # [n_padded, block counters]
+            mod.route(ids, local_ids, sorted_ids, bexp, npad, data["config"]["local_start"], bsm)
         cache2 = torch.empty((numel, 4096), dtype=x.dtype, device=dev)
         v1 = min(v1, len(G1_VARIANTS[bsm]) - 1)
         v2 = min(v2, len(G2_VARIANTS[bsm]) - 1)
@@ -1217,12 +1308,12 @@ def _compile_new_kernels(weights):
             def g1(x, sorted_ids, block_experts, n_padded, out, bsm):
                 vv = min(v1, len(G1_VARIANTS[bsm]) - 1)
                 mod.launch(1, x, p13[_sf(G1_VARIANTS[bsm][vv])], gs13, sorted_ids, block_experts, n_padded, out, bsm,
-                           vv, (mode_box[0] | pdl_box[0]) & ~8)
+                           vv, (mode_box[0] | pdl_box[0]) & ~24)
         if v2 is not None:
             def g2(x, sorted_ids, block_experts, n_padded, out, bsm):
                 vv = min(v2, len(G2_VARIANTS[bsm]) - 1)
                 mod.launch(2, x, p2[_sf(G2_VARIANTS[bsm][vv])], gs2, sorted_ids, block_experts, n_padded, out, bsm,
-                           vv, (mode_box[0] | pdl_box[0]) & ~8)
+                           vv, (mode_box[0] | pdl_box[0]) & ~24)
         return _marlin_forward(data, state, gemm1=g1, gemm2=g2, norm=_norm if norm else None)
 
     return _forward, mode_box, pdl_box
@@ -1445,6 +1536,7 @@ def _gate_shapes(state, device) -> None:
         full_us = float("inf")
         early_us = float("inf")
         flags_us = float("inf")
+        inroute_us = float("inf")
         full = False
         if g1_keep is not None:
             for v2 in range(len(G2_VARIANTS[bsm])):
@@ -1529,6 +1621,17 @@ def _gate_shapes(state, device) -> None:
                 if ok and us < best[3]:
                     best = (best[0], best[1], best[2], us)
                     pdl_on = 268
+            if pdl_on and full and state.get("inroute_ok") and best[1] is not None:
+                pbox[0] = pdl_on | 16
+                ok, us = _try(name, f"INROUTE pdl={pdl_on | 16} g1={best[0]} g2={best[1]} norm={best[2]} bsm={tile}",
+                              lambda d, s, c=cfg5: new_fn(d, s, v1=c[0], v2=c[1], norm=c[2], full=c[3], bsm=c[4]),
+                              data, state, ref, mode_box)
+                pbox[0] = 256
+                inroute_us = us if ok else float("inf")
+                print(f"INROUTE shape={name} inroute_us={us:.2f} best_us={best[3]:.2f}", flush=True)
+                if ok and us < best[3]:
+                    best = (best[0], best[1], best[2], us)
+                    pdl_on = pdl_on | 16
         state["pdl"][bs] = pdl_on
         use_new = custom and best[3] < marlin_us * 0.97
         state["enabled"][bs] = use_new
@@ -1538,7 +1641,7 @@ def _gate_shapes(state, device) -> None:
               f"choice={'new' if use_new else 'marlin'}", flush=True)
         summary.append(f"SUMMARY shape={name} choice={'new' if use_new else 'marlin'} cfg={state['cfg'][bs]} "
                        f"pdl={pdl_on} new_us={best[3]:.2f} marlin_us={marlin_us:.2f} nonfull_best_us={nonfull_us:.2f} "
-                       f"full_best_us={full_us:.2f} early_us={early_us:.2f} flags_us={flags_us:.2f}")
+                       f"full_best_us={full_us:.2f} early_us={early_us:.2f} flags_us={flags_us:.2f} inroute_us={inroute_us:.2f}")
 
 
 def _pdl_selftest(state, device):
@@ -1658,6 +1761,23 @@ def prepare(weights):
             print("FLAGS_OK", flush=True)
         except Exception as exc:
             print(f"FLAGS_DISABLED {type(exc).__name__}: {str(exc)[:300]}", flush=True)
+        finally:
+            state["pdl_box"][0] = 256
+    state["ctr"] = torch.zeros((1 + 2 * 2048,), dtype=torch.int32, device=device)
+    state["inroute_ok"] = False
+    if state["pdl_ok"]:
+        try:
+            _early_selftest(state, device, mode=272)
+            if state["flags_ok"]:
+                _early_selftest(state, device, mode=284)
+            torch.cuda.synchronize()
+            if int(state["ctr"].abs().sum().item()) != 0:
+                raise RuntimeError("block counters not re-armed")
+            state["inroute_ok"] = True
+            print("INROUTE_OK", flush=True)
+        except Exception as exc:
+            print(f"INROUTE_DISABLED {type(exc).__name__}: {str(exc)[:300]}", flush=True)
+            state["ctr"].zero_()
         finally:
             state["pdl_box"][0] = 256
     try:
