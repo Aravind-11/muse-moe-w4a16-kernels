@@ -1,12 +1,12 @@
 # okc: problem=muse_moe_w4a16
 # ==================================================================================================
-# v27 — decode work moved from the ALU pipe to the FMA pipe
-# Judged score: 1.8042× scored (`01b2da2380c44ff8`)   (previous best: 1.6776× (v26))
-# Built on: v26
+# v28 — two scales per register for 1-byte scales
+# Judged score: 1.8458× scored (`196ad392b4524623`)   (previous best: 1.8042× (v27))
+# Built on: v27
 #
 # What this version does and why it is faster: see README.md in this folder.
 # Every line that produced this version's speedup is marked with a comment starting
-# 'SPEEDUP (v27)' (search for it). Those comments are the only change from the judged file;
+# 'SPEEDUP (v28)' (search for it). Those comments are the only change from the judged file;
 # no code was altered.
 # ==================================================================================================
 """NVFP4 routed experts on H200.
@@ -319,7 +319,6 @@ __device__ __forceinline__ void mma16816(float c[4], uint32_t a0, uint32_t a1, u
 __device__ __forceinline__ void deq(uint32_t w, uint32_t r[4]) {
   const uint32_t M = 0x81C081C0u;
   r[0] = w & M;
-  // SPEEDUP (v27): w*16 is an IMAD (FMA pipe) instead of a funnel shift (ALU pipe); identical under mask M.
   r[1] = (w * 16u) & M;  // == rotl(w,4) & M (wrapped bits are masked); IMAD, not SHF
   r[2] = __funnelshift_l(w, w, 10) & M;
   r[3] = ((w * 64u) & 0x80C080C0u) | (__funnelshift_l(w, w, 14) & 0x01000100u);  // w*64 == rotl(w,6) under the mask
@@ -328,13 +327,11 @@ __device__ __forceinline__ void deq(uint32_t w, uint32_t r[4]) {
 // Coded scale byte s of u -> bf16x2 (both halves) = scale * 2^60. Then A = w * 2^-66.
 __device__ __forceinline__ uint32_t scale_dup(uint32_t u, int s, uint32_t k16) {
   uint32_t x = __byte_perm(u, 0u, 0x4040u | ((unsigned)s << 8) | (unsigned)s);
-  // SPEEDUP (v27): opaque multiplier -> IMAD on the FMA pipe instead of LEA on the saturated ALU pipe.
   return x * k16 + 0x58805880u;  // k16 == 16 at run time, opaque to ptxas: IMAD (FMA pipe), not LEA (ALU)
 }
 
 // bf16 scale word b holds two scales; multiply a by its low or high half broadcast to both lanes.
 // __hmul2 with __low2bfloat162/__high2bfloat162 folds into HMUL2's .H0_H0/.H1_H1 operand selector.
-// SPEEDUP (v27): broadcast a scale half inside the multiply (HMUL2 .H0_H0/.H1_H1): no PRMT needed.
 __device__ __forceinline__ uint32_t hmul2_lo(uint32_t a, uint32_t b) {
   const __nv_bfloat162 r = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&a),
                                    __low2bfloat162(*reinterpret_cast<const __nv_bfloat162*>(&b)));
@@ -349,6 +346,8 @@ __device__ __forceinline__ uint32_t hmul2_hi(uint32_t a, uint32_t b) {
 template <int SF>
 __device__ __forceinline__ uint32_t hmul2_sc(uint32_t a, uint32_t b, int s) {
   if constexpr (SF == 1) return (s & 1) ? hmul2_hi(a, b) : hmul2_lo(a, b);
+  // SPEEDUP (v28): for 1-byte scales, atoms 0/1 use the low half, atoms 2/3 the high half.
+  else if constexpr (SF == 0) return (s & 2) ? hmul2_hi(a, b) : hmul2_lo(a, b);  // x02 / x13 pairs
   else return hmul2(a, b);
 }
 
@@ -540,15 +539,23 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
       wv[m][3] = w4.w;
       if constexpr (SF == 0) {
         const uint2 u = *reinterpret_cast<const uint2*>(pw + m * MATB + 512 + grp * 8);
-#pragma unroll
-        for (int s = 0; s < 4; ++s) {
-          sc[m][0][s] = scale_dup(u.x, s, k16);
-          sc[m][1][s] = scale_dup(u.y, s, k16);
-        }
+        // SPEEDUP (v28): one word holds two scales; the multiply picks the half (4 ops per row word instead of 8).
+        // two scales per word: atoms 0|2 and 1|3 (hmul2_sc<0> picks the half); == scale_dup per half
+        const uint32_t r0_02 = (u.x & 0x00FF00FFu) * k16 + 0x58805880u;
+        const uint32_t r0_13 = __byte_perm(u.x, 0u, 0x4341u) * k16 + 0x58805880u;
+        const uint32_t r1_02 = (u.y & 0x00FF00FFu) * k16 + 0x58805880u;
+        const uint32_t r1_13 = __byte_perm(u.y, 0u, 0x4341u) * k16 + 0x58805880u;
+        sc[m][0][0] = r0_02;
+        sc[m][0][1] = r0_13;
+        sc[m][0][2] = r0_02;
+        sc[m][0][3] = r0_13;
+        sc[m][1][0] = r1_02;
+        sc[m][1][1] = r1_13;
+        sc[m][1][2] = r1_02;
+        sc[m][1][3] = r1_13;
       } else if constexpr (SF == 1) {
         // bf16 per scale: rows grp / grp+8, atoms 0..3, two per word -> duplicate the half.
         const uint4 v = *reinterpret_cast<const uint4*>(pw + m * MATB + 512 + grp * 16);
-        // SPEEDUP (v27): the 8 __byte_perm duplications per matrix per tile are gone.
         // raw words; hmul2_sc<1> broadcasts half (s & 1) inside the multiply (no PRMT)
         sc[m][0][0] = v.x;
         sc[m][0][1] = v.x;
@@ -914,6 +921,12 @@ for _b, _vs in {8: [(1, 1, 104, 4), (1, 1, 4, 4)], 16: [(1, 2, 104, 4)], 32: [(1
     G1_VARIANTS[_b] = list(G1_VARIANTS[_b]) + _vs
 
 
+# v28: 1-byte-scale, 3-stage twins (appended; earlier indices unchanged)
+for _b, _vs in {16: [(4, 2, 3, 2)], 32: [(4, 4, 3, 2)]}.items():
+    G1_VARIANTS[_b] = list(G1_VARIANTS[_b]) + _vs
+    G2_VARIANTS[_b] = list(G2_VARIANTS[_b]) + _vs
+
+
 def _sf(cfg):
     """Scale format of a variant: the hundreds digit of its stage field."""
     return cfg[2] // 100
@@ -1091,7 +1104,7 @@ def _build_extension():
 
     from torch.utils.cpp_extension import load
 
-    root = tempfile.mkdtemp(prefix="muse_v27_")
+    root = tempfile.mkdtemp(prefix="muse_v28_")
     sources = []
     cpp = os.path.join(root, "muse_ext.cpp")
     with open(cpp, "w") as f:
@@ -1109,7 +1122,7 @@ def _build_extension():
             sources.append(path)
     os.environ.setdefault("MAX_JOBS", str(max(4, min(16, os.cpu_count() or 4))))
     return load(
-        name="muse_v27_ext",
+        name="muse_v28_ext",
         sources=sources,
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
