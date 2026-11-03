@@ -1,12 +1,12 @@
 # okc: problem=muse_moe_w4a16
 # ==================================================================================================
-# v22 — programmatic dependent launch (PDL) + lighter loop bookkeeping
-# Judged score: 1.6294× scored (`a2cff897065f4452`)   (previous best: 1.6253× (v21))
-# Built on: v21
+# v24 — GEMM2 prefetches its weights before waiting on GEMM1
+# Judged score: 1.6565× scored (`37b2b48ef0f24d22`)   (previous best: 1.6294× (v22))
+# Built on: v22
 #
 # What this version does and why it is faster: see README.md in this folder.
 # Every line that produced this version's speedup is marked with a comment starting
-# 'SPEEDUP (v22)' (search for it). Those comments are the only change from the judged file;
+# 'SPEEDUP (v24)' (search for it). Those comments are the only change from the judged file;
 # no code was altered.
 # ==================================================================================================
 """NVFP4 routed experts on H200.
@@ -253,7 +253,6 @@ __device__ __forceinline__ void cp16(void* smem, const void* gmem) {
 __device__ __forceinline__ void cp16a(unsigned smem, const void* gmem) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem), "l"(gmem) : "memory");
 }
-// SPEEDUP (v22): PDL primitives. wait = block until the previous grid finished; trigger = let the next grid launch.
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" :::); }
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
@@ -347,8 +346,11 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
   static_assert(KT % KS == 0, "KS must divide 64");
   static_assert((KS - 1) * NW * MATS * G * 4 * 32 * 4 <= S * STAGE, "reduction buffer");
 
-  // SPEEDUP (v22): GEMM CTAs are already resident when the previous kernel ends; they start immediately.
-  pdl_wait();  // inputs come from the previous kernel (PDL launch); no-op on a plain launch
+  // mode bit 4 (early): GEMM1 lets its dependents launch at once; GEMM2 waits only before its activations.
+  // SPEEDUP (v24): 'early' mode: GEMM1 releases its dependents at once; GEMM2 waits only before activations.
+  const bool early = (mode & 4) != 0;
+  if (KIND == 1 || !early) pdl_wait();  // inputs come from the previous kernel (PDL launch); no-op on a plain launch
+  if (KIND == 1 && early) pdl_trigger();
   const int blk = (int)blockIdx.y;
   if (blk * T >= *n_padded) return;
   const int expert = block_experts[blk];
@@ -412,7 +414,7 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
     adst[j] = sbase_u32 + (unsigned)(k2 * SUB + SUB_W + tok * (ACT_LD * 2) + c * 16);
   }
 
-  auto issue = [&](int kto, int st) {
+  auto issue_w = [&](int kto, int st) {
     char* sbase = stages + st * STAGE;
     if (tid == 0) {
       mbar_expect_tx(&bars[st], (unsigned)(KS * SUB_W));
@@ -421,10 +423,16 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
         tma_1d(sbase + k2 * SUB, wsrc + (size_t)(kto * KS + k2) * NTU * PIECE, (unsigned)SUB_W, &bars[st]);
       }
     }
+  };
+  auto issue_a = [&](int kto, int st) {
 #pragma unroll
     for (int j = 0; j < CPT; ++j) {
       if (aval[j]) cp16a(adst[j] + (unsigned)(st * STAGE), asrc[j] + kto * (KS * 64));
     }
+  };
+  auto issue = [&](int kto, int st) {
+    issue_w(kto, st);
+    issue_a(kto, st);
   };
 
   float acc[MATS][G][4];
@@ -435,13 +443,26 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
 #pragma unroll
       for (int i = 0; i < 4; ++i) acc[m][g][i] = 0.0f;
 
+  // SPEEDUP (v24): weights need only the router's output, so issue their stages before waiting on GEMM1.
+  if (KIND == 2 && early) {
+    // Weights need only the router's output; stream them while GEMM1 finishes, then wait for its activations.
 #pragma unroll
-  for (int s = 0; s < S - 1; ++s) {
-    issue(s, s);
-    cp_commit();
+    for (int s = 0; s < S - 1; ++s) issue_w(s, s);
+    pdl_wait();
+#pragma unroll
+    for (int s = 0; s < S - 1; ++s) {
+      issue_a(s, s);
+      cp_commit();
+    }
+  } else {
+#pragma unroll
+    for (int s = 0; s < S - 1; ++s) {
+      issue(s, s);
+      cp_commit();
+    }
   }
 
-  const bool loads_only = (mode == 1);
+  const bool loads_only = ((mode & 3) == 1);
   const char* const sbase0 = stages + ks * SUB;  // this warp's K slice in stage 0
   int st = 0;           // stage consumed this tile
   int ist = S - 1;      // stage the next issue fills
@@ -556,9 +577,8 @@ moe_gemm_kernel(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__
     }
   }
 
-  // SPEEDUP (v22): after the K loop, allow the next kernel to start launching during our epilogue.
   pdl_trigger();  // main work done: let the next kernel's CTAs start launching
-  if (mode == 1) return;
+  if ((mode & 3) == 1) return;
   if constexpr (KS > 1) {
     // Sum the KS partial accumulators of each 16-row unit through shared memory (lane-fastest).
     constexpr int NACC = MATS * G * 4;
@@ -1007,7 +1027,7 @@ def _build_extension():
 
     from torch.utils.cpp_extension import load
 
-    root = tempfile.mkdtemp(prefix="muse_v22_")
+    root = tempfile.mkdtemp(prefix="muse_v24_")
     sources = []
     cpp = os.path.join(root, "muse_ext.cpp")
     with open(cpp, "w") as f:
@@ -1025,7 +1045,7 @@ def _build_extension():
             sources.append(path)
     os.environ.setdefault("MAX_JOBS", str(max(4, min(16, os.cpu_count() or 4))))
     return load(
-        name="muse_v22_ext",
+        name="muse_v24_ext",
         sources=sources,
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
@@ -1298,6 +1318,7 @@ def _gate_shapes(state, device) -> None:
     new_fn = state["new_fn"]
     mode_box = state["mode_box"]
     bank = state["banks"][(0, 32)]
+    summary = state.setdefault("summary", [])
     hidden = state["norm_w"].shape[0]
     d_expert = bank["size_n"]
     for name, bs in SCORED_SHAPES:
@@ -1343,6 +1364,9 @@ def _gate_shapes(state, device) -> None:
                           lambda d, s, v2=v2: new_fn(d, s, v1=g1_keep, v2=v2, norm=norm), data, state, ref, mode_box)
             if ok and us < best[3]:
                 best = (g1_keep, v2, norm, us)
+        nonfull_us = best[3]
+        full_us = float("inf")
+        early_us = float("inf")
         full = False
         if g1_keep is not None:
             for v2 in range(len(G2_VARIANTS[bsm])):
@@ -1350,6 +1374,8 @@ def _gate_shapes(state, device) -> None:
                     ok, us = _try(name, f"FULL g1={g1_keep} g2={v2} norm={nrm}",
                                   lambda d, s, v2=v2, nrm=nrm: new_fn(d, s, v1=g1_keep, v2=v2, norm=nrm, full=True),
                                   data, state, ref, mode_box)
+                    if ok:
+                        full_us = min(full_us, us)
                     if ok and us < best[3]:
                         best = (g1_keep, v2, nrm, us)
                         full = True
@@ -1403,6 +1429,17 @@ def _gate_shapes(state, device) -> None:
             if ok and us < best[3]:
                 best = (best[0], best[1], best[2], us)
                 pdl_on = 0
+            if pdl_on and state.get("early_ok") and best[1] is not None:
+                pbox[0] = 260
+                ok, us = _try(name, f"EARLY g1={best[0]} g2={best[1]} norm={best[2]} full={full} bsm={tile}",
+                              lambda d, s, c=cfg5: new_fn(d, s, v1=c[0], v2=c[1], norm=c[2], full=c[3], bsm=c[4]),
+                              data, state, ref, mode_box)
+                pbox[0] = 256
+                early_us = us if ok else float("inf")
+                print(f"EARLY shape={name} early_us={us:.2f} best_us={best[3]:.2f}", flush=True)
+                if ok and us < best[3]:
+                    best = (best[0], best[1], best[2], us)
+                    pdl_on = 260
         state["pdl"][bs] = pdl_on
         use_new = custom and best[3] < marlin_us * 0.97
         state["enabled"][bs] = use_new
@@ -1410,6 +1447,9 @@ def _gate_shapes(state, device) -> None:
         print(f"GATE shape={name} bs={bs} live_experts={live} bsm={tile or bsm} g1={best[0]} g2={best[1]} norm={best[2]} full={full} "
               f"new_us={best[3]:.2f} marlin_us={marlin_us:.2f} speedup={marlin_us / best[3]:.3f} "
               f"choice={'new' if use_new else 'marlin'}", flush=True)
+        summary.append(f"SUMMARY shape={name} choice={'new' if use_new else 'marlin'} cfg={state['cfg'][bs]} "
+                       f"pdl={pdl_on} new_us={best[3]:.2f} marlin_us={marlin_us:.2f} nonfull_best_us={nonfull_us:.2f} "
+                       f"full_best_us={full_us:.2f} early_us={early_us:.2f}")
 
 
 def _pdl_selftest(state, device):
@@ -1432,6 +1472,34 @@ def _pdl_selftest(state, device):
     torch.cuda.synchronize()
     if not torch.allclose(out.float(), ref.float(), rtol=0, atol=0):
         raise RuntimeError("PDL graph replay differs from eager")
+
+
+def _early_selftest(state, device):
+    new_fn = state["new_fn"]
+    pbox = state["pdl_box"]
+    bank = state["banks"][(0, 32)]
+    for bs in (8, 128):
+        data = _random_routed(bs, device, state["norm_w"].shape[0], bank["size_n"], seed=4343 + bs)
+        fn = lambda d=data: new_fn(d, state, v1=0, v2=0, norm=True, full=True)  # noqa: E731
+        pbox[0] = 0
+        ref = fn().clone()
+        torch.cuda.synchronize()
+        pbox[0] = 260
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            fn()
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = fn()
+        for _ in range(20):
+            g.replay()
+            torch.cuda.synchronize()
+            if not torch.equal(out, ref):
+                raise RuntimeError(f"early-prefetch replay differs from plain launch at bs={bs}")
+        del g
 
 
 def prepare(weights):
@@ -1483,12 +1551,24 @@ def prepare(weights):
         except Exception as exc:
             state["pdl_box"][0] = 0
             print(f"PDL_DISABLED {type(exc).__name__}: {str(exc)[:300]}", flush=True)
+    state["early_ok"] = False
+    if state["pdl_ok"]:
+        try:
+            _early_selftest(state, device)
+            state["early_ok"] = True
+            print("EARLY_OK", flush=True)
+        except Exception as exc:
+            print(f"EARLY_DISABLED {type(exc).__name__}: {str(exc)[:300]}", flush=True)
+        finally:
+            state["pdl_box"][0] = 256
     try:
         _gate_shapes(state, device)
     except Exception as exc:
         state["enabled"] = {}
         state["new_fn"] = None
         print(f"GATE_ABORT {type(exc).__name__}: {exc}", flush=True)
+    for line in state.get("summary", []):
+        print(line, flush=True)
     torch.cuda.synchronize()
     print(f"PREPARE_DONE elapsed_s={_elapsed():.1f} enabled={state['enabled']} cfg={state['cfg']}", flush=True)
     return state
